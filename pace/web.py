@@ -26,6 +26,7 @@ from pace import git as g
 from pace import items as it
 from pace.db import now
 from pace import roadmap
+from pace import windows
 from pace.roadmap import RoadmapError
 from pace.runs import activity_line, git_project, latest_impl_output, latest_plan
 
@@ -69,7 +70,15 @@ def fromjson(s: str | None) -> Any:
     return json.loads(s) if s else None
 
 
-templates.env.filters.update(md=md, mdi=md_inline, diff=diff_html, age=age, fromjson=fromjson)
+def clock(t: datetime | None) -> str:
+    """A window boundary: `22:00`, or `Tue 22:00` when it isn't today."""
+    if t is None:
+        return "?"
+    return t.strftime("%H:%M" if t.date() == windows.local_now().date() else "%a %H:%M")
+
+
+templates.env.filters.update(md=md, mdi=md_inline, diff=diff_html, age=age, fromjson=fromjson,
+                             clock=clock)
 
 INBOX_GROUPS = [("needs_input", "Questions"), ("plan_ready", "Plans to approve"),
                 ("ready_to_test", "Ready to test"), ("failed", "Problems")]
@@ -83,6 +92,7 @@ def render(request: Request, name: str, status: int = 200, **ctx: Any) -> HTMLRe
         "all_projects": it.projects(st.db),
         "rate_limit": st.db.kv_get("rate_limit"),
         "running": st.runner.active(),
+        "window": windows.status(st.cfg.run_windows),
         **ctx,
     }, status_code=status)
 

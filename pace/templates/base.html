@@ -16,6 +16,13 @@
   <a href="/projects/new" class="muted">+ project</a>
   <span class="spacer"></span>
   {% if running %}<span class="pill running" title="runs in progress">{{ running }} running</span>{% endif %}
+  {% if not window.always %}
+    {% if window.open %}
+      <span class="pill" title="run window open{% if window.closes_at %} until {{ window.closes_at.strftime('%Y-%m-%d %H:%M %Z') }}{% endif %}">window{% if window.closes_at %} until {{ window.closes_at | clock }}{% endif %}</span>
+    {% else %}
+      <span class="pill bad" title="outside the run windows: the scheduler starts nothing until {{ window.next_open.strftime('%Y-%m-%d %H:%M %Z') }}; manual actions still run">paused until {{ window.next_open | clock }}</span>
+    {% endif %}
+  {% endif %}
   {% if rate_limit %}
     {% set w = rate_limit.unifiedWindows or {} %}
     <span class="pill {% if rate_limit.status != 'allowed' %}bad{% endif %}" title="Claude usage (as of {{ rate_limit.seen_at }})">

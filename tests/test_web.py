@@ -184,3 +184,10 @@ def test_import_through_ui(client, db, runner, scenario, project):
     assert (row["kind"], row["group_id"]) == ("chore", None)
     post(client, "/p/TOY/items", title="Late", group_id=str(gid))
     assert it.item(db, "TOY-003")["group_id"] == gid
+
+
+def test_run_window_pill(client, cfg):
+    assert "paused until" not in client.get("/").text and "window until" not in client.get("/").text
+    cfg.run_windows = ["00:00-12:00", "12:00-23:59"]
+    page = client.get("/").text
+    assert "paused until" in page or "window until" in page

@@ -78,7 +78,7 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 ## 5. Configuration
 
-**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (§9), per-run timeout. It holds no secrets: git push uses per-project deploy keys (or `pace`'s own SSH setup) and PRs use `pace`'s `gh auth`.
+**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (`HH:MM-HH:MM`, server local time, §9), per-run timeout. It holds no secrets: git push uses per-project deploy keys (or `pace`'s own SSH setup) and PRs use `pace`'s `gh auth`.
 
 **Project settings** (stored in the DB, edited with a UI form):
 
@@ -232,7 +232,9 @@ Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `answers`, `revis
 
 ## 9. Scheduler
 
-A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** (e.g. `run_windows = ["22:00-08:00"]`; empty means always) and outside rate-limit backoff (§8.1). Runs already in progress always finish.
+A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** and outside rate-limit backoff (§8.1). Runs already in progress always finish.
+
+**Run windows:** `run_windows = ["22:00-08:00"]` in `config.toml`; empty or absent means always. Each window is `HH:MM-HH:MM` in the server's local time (the VM timezone, or `TZ` in the systemd unit); the start is inclusive and the end exclusive, an end earlier than the start spans midnight, `24:00` is allowed as an end, and a window can't start and end at the same time. Several windows combine: any open one is enough. A malformed window stops the server at startup. Outside the windows the scheduler starts nothing; an opening window is picked up by the next tick. **Explicit human starts bypass the window:** Plan now, Implement now, Start fix now, answers, revise-plan, Retry, Works → merge (and the conflict resolution it may start) and import all run straight away. Approve and Problem only queue work, so the `implement` / `address_feedback` after them waits for the window. The nav and the System page show "window until HH:MM" or "paused until HH:MM".
 
 1. `changes_requested` → start `address_feedback`.
 2. `approved` → start `implement`, in roadmap order, if dependencies are merged, an implementation slot is free and `ready_to_test` < `test_ahead`.
@@ -316,7 +318,7 @@ Every state transition is a single transaction that also writes an `events` row.
    - **Test & merge:** summary, what Claude verified, the manual checks as a checklist, the diff, the branch/PR with a checkout command, and Works → merge / Problem….
    - **Activity:** events and runs, with the live stream for the current run.
 3. **Project page:** the roadmap as an ordered list with state badges, plus reorder, quick add, edit, park, edit as markdown, import, the settings form and pause.
-4. **System:** current runs, backoff and run-window status, recent errors, usage per run.
+4. **System:** current runs, backoff and run-window status (open until X / closed, opens at Y), recent errors, usage per run.
 
 **Notifications:** an ntfy push when the inbox gains entries, at most one every N minutes, with a deep link.
 
