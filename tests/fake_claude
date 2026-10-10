@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Stand-in for `claude -p` that replays recorded stream-json, so tests spend no quota.
+
+Picks a fixture from tests/fixtures/stream/ by run type:
+  implement schema            → implement_done (and commits a file in cwd)
+  plan schema with --resume   → plan_ready
+  plan schema, fresh          → plan_needs_input
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "stream"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-p", dest="prompt")
+ap.add_argument("--resume")
+ap.add_argument("--json-schema")
+ap.add_argument("--permission-mode")
+ap.add_argument("--dangerously-skip-permissions", action="store_true")
+args, _ = ap.parse_known_args()
+
+if "commit_message" in (args.json_schema or ""):
+    if not args.dangerously_skip_permissions:
+        sys.exit("fake_claude: implement run without write permissions")
+    Path("fake_change.txt").write_text("implemented by fake_claude\n")
+    ident = ["-c", "user.name=fake", "-c", "user.email=fake@localhost"]
+    subprocess.run(["git", *ident, "add", "fake_change.txt"], check=True)
+    subprocess.run(["git", *ident, "commit", "-qm", "fake change"], check=True)
+    fixture = "implement_done"
+elif args.resume:
+    fixture = "plan_ready"
+else:
+    fixture = "plan_needs_input"
+
+sys.stdout.write((FIXTURES / f"{fixture}.jsonl").read_text())
