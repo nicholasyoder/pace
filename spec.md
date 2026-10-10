@@ -1,4 +1,4 @@
-# PACE — Spec (v0.3)
+# PACE — Spec (v0.4)
 
 **PACE** (Plan · Approve · Code · Evaluate). A personal, self-hosted orchestrator that turns per-project roadmaps into a steady pipeline of plans and implementations driven by Claude Code, and only interrupts me when a decision or a manual check is needed.
 
@@ -49,7 +49,7 @@ One process, one SQLite DB, background work as asyncio tasks.
 
 ```
 pace/
-  main.py config.py db.py
+  main.py config.py db.py web.py bus.py items.py actions.py
   scheduler.py runs.py agent.py git.py roadmap.py notify.py
   prompts/ schemas/ templates/ static/ migrations/
 tests/ (fake_claude, fixtures/stream/)
@@ -70,7 +70,7 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 - **Project**: a codebase, its roadmap and its settings.
 - **Item**: one roadmap entry, with a stable ID like `WEB-014` that is never reused.
-- **Run**: one `claude` invocation for an item. Kinds: `plan`, `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, and `import` (not tied to an item).
+- **Run**: one `claude` invocation for an item. Kinds: `plan`, `answers` (the follow-up after I answer questions), `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, and `import` (not tied to an item).
 - **Inbox entry**: derived from item state when I need to act (§7).
 
 ---
@@ -165,7 +165,9 @@ sudo -n -u pace-agent -H -D <worktree> ~pace-agent/.local/bin/claude \
 - **Sessions:** the first run stores its `session_id`, and every later run on the item resumes that session in the same worktree path. If resume fails, start a fresh session and put the plan, the Q&A history and the feedback into the prompt.
 - **Invalid or missing structured output** gets one automatic retry that says what was wrong. After that the item goes to `failed`.
 - **Rate limits / quota:** every run emits `rate_limit_event`s whose `rate_limit_info` has `status` (`allowed` normally), `resetsAt`, and `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`. PACE stores the latest one. The scheduler stops starting runs while utilization is above a configured threshold, or while `status` isn't `allowed`, until `resetsAt`, and the UI shows a banner. A run that fails on a limit anyway is marked `rate_limited` and the item returns to its prior state. The exact failure shape is still unseen, so detect it loosely.
-- Every run has a hard timeout.
+- Every run has a hard timeout. Timeouts and **Stop run** send SIGTERM to sudo, which relays it to `claude`, which kills its tool processes and exits (verified in M1). SIGKILL comes only after a 15 s grace period, because it would kill just sudo and orphan `claude` under the agent user, where PACE can't signal it.
+- `--model` doesn't apply to plan mode: with `--model haiku`, plan runs still reported Sonnet usage.
+- **Retry** re-runs the failed run's kind with the same inputs (stored in `runs.input_json`). A failed merge retries the merge.
 
 ### 8.2 Output contracts (JSON schemas)
 
@@ -216,7 +218,9 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 4. Respect the global concurrency cap.
 5. More than 3 attempts in one state → `failed`, with the reason.
 
-**On startup:** any run still marked `running` becomes `interrupted`, its PID is killed if still alive, and the item is re-queued to resume its session.
+**On startup:** any run still marked `running` becomes `interrupted`, its sudo PID gets SIGTERM if still alive, and the item is re-queued to resume its session. (M1 sends the item to `failed` and leaves the rest to Retry; M2 re-queues automatically.)
+
+**Before M2:** human actions start the follow-up run directly when a slot is free (Plan now, answers, feedback, Approve → implement, Problem → `address_feedback`). If no slot is free, the item waits in `approved` / `changes_requested` with a button to start it.
 
 **Controls:** pause project, pause all, plan now, move to top, park, retry.
 
@@ -260,10 +264,10 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 ## 12. Data model (SQLite)
 
 - `projects(id, slug, name, origin, base_branch, merge_mode, merge_strategy, plan_ahead, test_ahead, max_concurrent_implementations, model, extra_instructions, next_id, paused)`
-- `items(id TEXT PK, project_id, position, title, description, depends_json, state, state_since, attempts, session_id, branch, plan_base_commit, impl_base_commit, pr_url, stale_json, summary, last_error, created_at, updated_at)`
+- `items(id TEXT PK, project_id, position, title, description, depends_json, state, state_since, attempts, session_id, branch, plan_base_commit, impl_base_commit, pr_url, stale_json, reverify, summary, last_error, created_at, updated_at)`
 - `plans(item_id, version, markdown, affected_files_json, created_at)`
 - `qa_rounds(item_id, round, questions_json, answers_json, answered_at)`
-- `runs(id, item_id, kind, status[queued|running|succeeded|failed|interrupted|rate_limited], pid, session_id, started_at, ended_at, exit_code, usage_json, output_json, log_path, error)`
+- `runs(id, item_id, kind, input_json, status[queued|running|succeeded|failed|interrupted|rate_limited], pid, session_id, started_at, ended_at, exit_code, cost_usd, usage_json, output_json, log_path, error)`
 - `proposals(id, project_id, source_item_id, title, description, reason, status)`
 - `events(id, item_id, ts, kind, actor[system|human|claude], data_json)`: an append-only audit log that includes feedback text and approvals.
 
@@ -290,8 +294,8 @@ Every state transition is a single transaction that also writes an `events` row.
 ## 14. Milestones (each must be usable)
 
 - **M0 — Spike (CLI, no UI). ✓ Done 2026-10-10.** `python -m pace.spike` took a toy item and nkms #24 through plan → questions → approve → implement as `pace-agent` → push → `merge-tree` squash merge. Findings are folded into this version. `fake_claude` replays recorded runs. `pace/agent.py`, `pace/git.py`, `pace/prompts/` and `pace/schemas/` carry into M1. `pace/spike.py` gets deleted once M1 replaces it.
-- **M1 — Core, end to end in local mode.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge.
-- **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps.
+- **M1 — Core, end to end in local mode. ✓ Built 2026-10-10.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge, `address_feedback` and `resolve_conflicts`. It was proven with real `claude` as `pace-agent` on a toy repo through plan → implement → Problem → fix → squash merge. Not in M1: the System page (moves to M2) and the proposal inbox actions (M3; proposals are stored and shown on the item page, deduped by title). Runs as `dev` via `uv run python -m pace` until the `pace` user and a systemd unit arrive at the end of M2.
+- **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps, the System page, and the `pace` user plus a systemd unit.
 - **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, import, proposed items, stale-plan flag. Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
 - **M4 — Phone pass.** Layout polish for phone use.
 
