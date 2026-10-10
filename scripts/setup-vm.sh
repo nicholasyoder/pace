@@ -44,11 +44,13 @@ install -d -o "$PACE_USER" -g "$PACE_USER" -m 0755 "$DATA_DIR/repos"
 install -d -o "$PACE_USER" -g "$PACE_USER" -m 0700 "$DATA_DIR/logs"
 
 # sudoers: only claude and git, as the agent, no password. sudo's env_reset and
-# secure_path give the agent a scrubbed environment.
+# secure_path give the agent a scrubbed environment. CWD=* permits `sudo -D`:
+# PACE can't chdir into the agent's private worktrees itself, and claude has no
+# --cwd flag.
 tmp="$(mktemp)"
 cat >"$tmp" <<EOF
 # Managed by pace/scripts/setup-vm.sh
-$PACE_USER ALL=($AGENT_USER) NOPASSWD: $AGENT_CLAUDE, /usr/bin/git
+$PACE_USER ALL=($AGENT_USER) CWD=* NOPASSWD: $AGENT_CLAUDE, /usr/bin/git
 EOF
 visudo -cf "$tmp" >/dev/null
 install -o root -g root -m 0440 "$tmp" "$SUDOERS_FILE"
