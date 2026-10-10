@@ -236,13 +236,15 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 
 1. `changes_requested` → start `address_feedback`.
 2. `approved` → start `implement`, in roadmap order, if dependencies are merged, an implementation slot is free and `ready_to_test` < `test_ahead`.
-3. While `planning` + `needs_input` + `plan_ready` < `plan_ahead`, plan the next `backlog` item in roadmap order whose dependencies are at least `approved`.
+3. While `planning` + `needs_input` + `plan_ready` < `plan_ahead`, plan the next `backlog` item in roadmap order whose dependencies are at least `approved`. Imports are never started by the scheduler; they start by hand.
 4. Respect the global concurrency cap.
 5. More than 3 attempts in one state → `failed`, with the reason.
 
+Each tick runs the steps across all unpaused projects in turn (feedback in every project, then implementation, then planning), so step 1 goes ahead of all other work. A wake-up is any change published on the bus.
+
 **On startup:** any run still marked `running` becomes `interrupted`, its sudo PID gets SIGTERM if still alive, and the item is re-queued to resume its session. (M1 sends the item to `failed` and leaves the rest to Retry; M2 re-queues automatically.)
 
-**Before M2:** human actions start the follow-up run directly when a slot is free (Plan now, answers, feedback, Approve → implement, Problem → `address_feedback`). If no slot is free, the item waits in `approved` / `changes_requested` with a button to start it.
+**Human actions only transition the item and wake the scheduler:** Approve → `approved`, Problem → `changes_requested`. Plan now, Implement now and Start fix now are manual overrides: they start the run straight away, skipping `plan_ahead` / `test_ahead` but not dependencies or slots. Answers and revise-plan still start their resumed run directly; if no slot is free they ask to try again.
 
 **Controls:** pause project, pause all, plan now, move to top, park, retry.
 

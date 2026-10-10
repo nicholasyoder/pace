@@ -1,0 +1,168 @@
+"""The scheduler (§9): what a tick starts, and the loop waking on bus messages."""
+
+import asyncio
+import time
+
+import pytest
+
+from pace import actions as act
+from pace import items as it
+from pace.scheduler import Scheduler, tick
+
+
+def state(db, item_id):
+    return it.item(db, item_id)["state"]
+
+
+def set_state(db, item_id, s):
+    db.run("UPDATE items SET state = ? WHERE id = ?", s, item_id)
+
+
+def drain(runner):
+    """Tick until nothing more starts, letting each run finish (one at a time)."""
+    started = []
+    while True:
+        now = tick(runner)
+        runner.wait()
+        if not now:
+            return started
+        started += now
+
+
+@pytest.fixture
+def fake_start(runner, monkeypatch):
+    """Record starts instead of running Claude; each recorded start holds a slot."""
+    starts = []
+    monkeypatch.setattr(runner, "start", lambda item_id, kind, inputs=None:
+                        starts.append((item_id, kind)))
+    monkeypatch.setattr(runner, "active", lambda: len(starts))
+    return starts
+
+
+def add(db, project, title, *deps):
+    return it.add_item(db, project["id"], title, depends=list(deps))
+
+
+def test_pipeline_flows_without_manual_starts(db, runner, cfg, scenario, project):
+    cfg.concurrency = 1  # runs go one at a time, so scenario lines are used in order
+    it.update_project(db, project["id"], plan_ahead=2, test_ahead=1)
+    a = add(db, project, "A")
+    b = add(db, project, "B", a)
+    c = add(db, project, "C")
+    d = add(db, project, "D", c)
+
+    scenario("plan_ready", "plan_ready")
+    assert drain(runner) == [(a, "plan"), (c, "plan")]  # B, D wait on approval
+    assert [state(db, x) for x in (a, b, c, d)] == ["plan_ready", "backlog", "plan_ready",
+                                                   "backlog"]
+
+    scenario("implement_done", "plan_ready")
+    act.approve(runner, a)
+    assert drain(runner) == [(a, "implement"), (b, "plan")]
+    assert state(db, a) == "ready_to_test" and state(db, b) == "plan_ready"
+
+    scenario("plan_ready")
+    act.approve(runner, c)
+    assert drain(runner) == [(d, "plan")]  # C waits: test_ahead = 1 is reached
+    assert state(db, c) == "approved"
+
+    act.merge(runner, a)
+    runner.wait()
+    scenario("implement_done")
+    assert drain(runner) == [(c, "implement")]
+
+    act.approve(runner, b)
+    act.approve(runner, d)
+    assert drain(runner) == []  # C is waiting to be tested
+    act.merge(runner, c)
+    runner.wait()
+    scenario("implement_done", "implement_done")
+    assert drain(runner) == [(b, "implement")]  # roadmap order; D waits for test_ahead
+    act.merge(runner, b)
+    runner.wait()
+    assert drain(runner) == [(d, "implement")]
+    assert scenario.left() == []
+
+    events = db.all("SELECT actor FROM events WHERE item_id = ? AND kind = 'state' AND "
+                    "data_json LIKE '%\"to\": \"planning\"%'", a)
+    assert [e["actor"] for e in events] == ["system"]
+
+
+def test_dependencies_skip_not_block(db, runner, cfg, project, fake_start):
+    it.update_project(db, project["id"], max_concurrent_implementations=3)
+    x = add(db, project, "X")
+    y = add(db, project, "Y", x)
+    z = add(db, project, "Z")
+    for i in (x, y, z):
+        set_state(db, i, "approved")
+    assert tick(runner) == [(x, "implement"), (z, "implement")]
+    assert state(db, y) == "approved"
+
+
+def test_feedback_goes_first_across_projects(db, runner, cfg, origin, project, fake_start):
+    cfg.concurrency = 1
+    add(db, project, "plan me")
+    other = it.create_project(db, slug="ZED", name="Zed", origin=str(origin), base_branch="main")
+    fix = add(db, other, "fix me")
+    set_state(db, fix, "changes_requested")
+    assert tick(runner) == [(fix, "address_feedback")]
+
+
+def test_implement_before_plan(db, runner, cfg, project, fake_start):
+    cfg.concurrency = 1
+    add(db, project, "plan me")
+    ok = add(db, project, "build me")
+    set_state(db, ok, "approved")
+    assert tick(runner) == [(ok, "implement")]
+
+
+def test_ahead_limits(db, runner, project, fake_start):
+    it.update_project(db, project["id"], plan_ahead=2, test_ahead=1)
+    tested = add(db, project, "tested")
+    set_state(db, tested, "ready_to_test")
+    waiting = add(db, project, "approved")
+    set_state(db, waiting, "approved")
+    asked = add(db, project, "asked")
+    set_state(db, asked, "needs_input")
+    first, second = add(db, project, "first"), add(db, project, "second")
+    assert tick(runner) == [(first, "plan")]  # needs_input + planning = plan_ahead
+    assert state(db, second) == "backlog" and state(db, waiting) == "approved"
+    assert tick(runner) == []
+
+
+def test_global_cap(db, runner, cfg, project, fake_start):
+    cfg.concurrency = 1
+    a, b = add(db, project, "a"), add(db, project, "b")
+    assert tick(runner) == [(a, "plan")]
+    assert tick(runner) == []  # a holds the only slot
+    assert state(db, b) == "backlog"
+
+
+def test_paused_projects_and_imports_are_left_alone(db, runner, project, fake_start):
+    it.add_import(db, project["id"])
+    assert tick(runner) == []  # imports are started by hand only
+    item = add(db, project, "a")
+    it.update_project(db, project["id"], paused=1)
+    assert tick(runner) == []
+    it.update_project(db, project["id"], paused=0)
+    assert tick(runner) == [(item, "plan")]
+
+
+def test_loop_wakes_on_publish(db, runner, project, fake_start):
+    async def main():
+        runner.bus.attach(asyncio.get_running_loop())
+        sched = Scheduler(runner, interval=60)
+        sched.start()
+        try:
+            await asyncio.sleep(0.2)  # the first tick finds nothing
+            assert fake_start == []
+            item = add(db, project, "a")
+            runner.publish("-")
+            deadline = time.monotonic() + 5
+            while not fake_start and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            assert fake_start == [(item, "plan")]
+        finally:
+            await sched.stop()
+
+    asyncio.run(main())

@@ -12,7 +12,7 @@ from pace.main import create_app
 
 @pytest.fixture
 def client(cfg, runner):
-    with TestClient(create_app(cfg, runner)) as c:
+    with TestClient(create_app(cfg, runner, scheduler=False)) as c:
         yield c
 
 
@@ -62,6 +62,7 @@ def test_full_flow_through_ui(client, db, runner, scenario, project, item):
     assert "recommended option" in answers
 
     post(client, f"/i/{item}/approve", runner)
+    post(client, f"/i/{item}/implement", runner)
     page = client.get(f"/i/{item}").text
     assert "Works → merge" in page and "git checkout pace/TOY-001" in page
     assert "fake_change.txt" in page  # diff
