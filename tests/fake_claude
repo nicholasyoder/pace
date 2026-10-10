@@ -9,6 +9,7 @@ With $FAKE_CLAUDE_SCENARIO set, each invocation pops the first line of that file
     resolve implement_done    # merge canon/$FAKE_BASE (-s ours) before replaying
     nocommit implement_done   # implement run that makes no commit
     noresume -                # resume fails like an unknown session (fixture unused)
+    ratelimited -             # hits a usage limit: rejected rate_limit_event, exit 1
 
 Without it, the fixture is picked by run type:
   implement schema            → implement_done
@@ -24,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "stream"
@@ -49,7 +51,7 @@ if scenario and Path(scenario).exists() and Path(scenario).read_text().strip():
     lines = Path(scenario).read_text().strip().splitlines()
     Path(scenario).write_text("\n".join(lines[1:]) + "\n")
     words = lines[0].split(" ", 1)
-    while words[0] in ("invalid", "resolve", "nocommit", "noresume"):
+    while words[0] in ("invalid", "resolve", "nocommit", "noresume", "ratelimited"):
         flags.add(words[0])
         words = words[1].split(" ", 1)
     fixture = words[0]
@@ -67,6 +69,18 @@ if "noresume" in flags:
     print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
                       "num_turns": 0, "session_id": args.resume, "total_cost_usd": 0,
                       "errors": [f"No conversation found with session ID: {args.resume}"]}))
+    sys.exit(1)
+
+if "ratelimited" in flags:
+    resets = int(time.time()) + 3600
+    print(json.dumps({"type": "rate_limit_event", "session_id": args.resume or "fake-limited",
+                      "rate_limit_info": {"status": "rejected", "resetsAt": resets,
+                                          "unifiedWindows": {"five_hour": {"utilization": 1.0,
+                                                                           "resetsAt": resets}}}}))
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1,
+                      "session_id": args.resume or "fake-limited", "total_cost_usd": 0,
+                      "result": "Claude AI usage limit reached"}))
+    print("Claude AI usage limit reached", file=sys.stderr)
     sys.exit(1)
 
 if implement:
