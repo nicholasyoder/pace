@@ -1,0 +1,14 @@
+{"type":"object","additionalProperties":false,
+ "required":["status","summary","roadmap_markdown","notes","questions","blocked_reason"],
+ "properties":{
+  "status":{"type":"string","enum":["needs_input","plan_ready","blocked"]},
+  "summary":{"type":"string"},
+  "roadmap_markdown":{"type":"string"},
+  "notes":{"type":"string"},
+  "questions":{"type":"array","items":{"type":"object","additionalProperties":false,
+     "required":["id","text","why_it_matters","options","recommended","allow_free_text"],
+     "properties":{"id":{"type":"string"},"text":{"type":"string"},"why_it_matters":{"type":"string"},
+       "options":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","label","description"],
+          "properties":{"id":{"type":"string"},"label":{"type":"string"},"description":{"type":"string"}}}},
+       "recommended":{"type":"string"},"allow_free_text":{"type":"boolean"}}}},
+  "blocked_reason":{"type":["string","null"]}}}

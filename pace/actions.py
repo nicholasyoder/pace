@@ -11,7 +11,9 @@ import json
 
 from pace import items as it
 from pace.db import now
-from pace.runs import IMPL_KINDS, PLAN_KINDS, Runner
+from pace import git as g
+from pace.roadmap import RoadmapError
+from pace.runs import IMPL_KINDS, PLAN_KINDS, Runner, git_project, latest_plan
 
 
 class ActionError(RuntimeError):
@@ -38,7 +40,15 @@ def plan(r: Runner, item_id: str) -> None:
         raise ActionError(f"waiting on {', '.join(unmet)} (dependencies must be approved first)")
     _capacity(r)
     it.transition(r.db, item_id, "planning", "human", expect="backlog")
-    r.start(item_id, "plan")
+    r.start(item_id, "import" if item["type"] == "import" else "plan")
+
+
+def start_import(r: Runner, project_id: int, instructions: str = "") -> str:
+    """Ask Claude to convert the repo's existing roadmap; returns the import item's ID."""
+    _capacity(r)
+    item_id = it.add_import(r.db, project_id, instructions)
+    plan(r, item_id)
+    return item_id
 
 
 def answer(r: Runner, item_id: str, answers: dict[str, str], decide_rest: bool = False) -> None:
@@ -68,6 +78,10 @@ def answer(r: Runner, item_id: str, answers: dict[str, str], decide_rest: bool =
 
 
 def approve(r: Runner, item_id: str) -> None:
+    item = it.item(r.db, item_id)
+    if item["type"] == "import":
+        _apply_import(r, item)
+        return
     it.transition(r.db, item_id, "approved", "human", expect="plan_ready")
     try:
         implement(r, item_id)
@@ -75,8 +89,27 @@ def approve(r: Runner, item_id: str) -> None:
         pass  # stays approved; the item page offers "Implement"
 
 
+def _apply_import(r: Runner, item) -> None:
+    plan_row = latest_plan(r.db, item["id"])
+    if plan_row is None:
+        raise ActionError("no proposed roadmap to apply")
+    with r.db.tx():
+        if it.item(r.db, item["id"])["state"] != "plan_ready":
+            raise ActionError(f"{item['id']} is {it.item(r.db, item['id'])['state']}, not plan_ready")
+        try:
+            created = it.apply_import(r.db, item["project_id"], plan_row["markdown"], item["id"])
+        except RoadmapError as e:
+            raise ActionError(f"the proposal no longer applies cleanly: {e}") from e
+        it.transition(r.db, item["id"], "merged", "human", expect="plan_ready",
+                      data={"created": created})
+    proj = it.project(r.db, item["project_id"])
+    g.remove_worktree(r.agent, git_project(r.cfg, proj), item["id"])
+
+
 def implement(r: Runner, item_id: str) -> None:
     item = it.item(r.db, item_id)
+    if item["type"] == "import":
+        raise ActionError("an import has nothing to implement")
     unmet = it.unmet_dependencies(r.db, item, "merged")
     if unmet:
         raise ActionError(f"waiting on {', '.join(unmet)} (dependencies must be merged first)")

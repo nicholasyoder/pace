@@ -25,7 +25,7 @@ ALLOWED: dict[str, set[str]] = {
     "backlog": {"planning", "parked"},
     "planning": {"needs_input", "plan_ready", "failed"},
     "needs_input": {"planning", "parked"},
-    "plan_ready": {"approved", "planning", "parked"},
+    "plan_ready": {"approved", "planning", "parked", "merged"},  # → merged: imports only
     "approved": {"implementing", "planning", "parked"},
     "implementing": {"ready_to_test", "failed"},
     "ready_to_test": {"merging", "changes_requested", "parked"},
@@ -38,7 +38,7 @@ ALLOWED: dict[str, set[str]] = {
 
 PROJECT_FIELDS = ["slug", "name", "origin", "base_branch", "merge_mode", "merge_strategy",
                   "plan_ahead", "test_ahead", "max_concurrent_implementations", "model",
-                  "extra_instructions", "paused"]
+                  "extra_instructions", "paused", "preamble"]
 ITEM_FIELDS = {"session_id", "branch", "plan_base_commit", "impl_base_commit", "pr_url",
                "stale_json", "reverify", "summary", "last_error", "attempts"}
 
@@ -89,19 +89,37 @@ def projects(db: DB) -> list[sqlite3.Row]:
 
 
 # --- items ------------------------------------------------------------------
+#
+# Priority order is (group position, item position); ungrouped items come
+# first. Item positions are only compared within a group. Import items
+# (type 'import') are never part of the roadmap itself.
+
+_ITEMS = ("SELECT items.*, g.title AS group_title FROM items "
+          "LEFT JOIN groups g ON g.id = items.group_id ")
+_ORDER = " ORDER BY COALESCE(g.position, -1), items.position, items.created_at"
+
 
 def item(db: DB, item_id: str) -> sqlite3.Row:
-    row = db.one("SELECT * FROM items WHERE id = ?", item_id)
+    row = db.one(_ITEMS + "WHERE items.id = ?", item_id)
     if row is None:
         raise NotFound(f"item {item_id}")
     return row
 
 
 def items(db: DB, project_id: int, active_only: bool = False) -> list[sqlite3.Row]:
-    sql = "SELECT * FROM items WHERE project_id = ?"
+    sql = _ITEMS + "WHERE items.project_id = ? AND items.type = 'item'"
     if active_only:
-        sql += " AND state NOT IN ('merged', 'parked')"
-    return db.all(sql + " ORDER BY position, created_at", project_id)
+        sql += " AND items.state NOT IN ('merged', 'parked')"
+    return db.all(sql + _ORDER, project_id)
+
+
+def imports(db: DB, project_id: int) -> list[sqlite3.Row]:
+    return db.all(_ITEMS + "WHERE items.project_id = ? AND items.type = 'import' "
+                  "ORDER BY items.created_at DESC", project_id)
+
+
+def groups(db: DB, project_id: int) -> list[sqlite3.Row]:
+    return db.all("SELECT * FROM groups WHERE project_id = ? ORDER BY position", project_id)
 
 
 def depends(row: sqlite3.Row) -> list[str]:
@@ -122,54 +140,89 @@ def _check_depends(db: DB, p: sqlite3.Row, deps: Iterable[str], self_id: str | N
             raise ValueError(f"unknown dependency {d}")
 
 
+def _check_kind(kind: str) -> str:
+    kind = kind.strip().lower()
+    if kind and not roadmap.KIND_OK.match(kind):
+        raise ValueError("kind must be one lowercase word (e.g. debt)")
+    return kind
+
+
+def _check_group(db: DB, project_id: int, group_id: int | None) -> None:
+    if group_id is not None and db.one("SELECT 1 FROM groups WHERE id = ? AND project_id = ?",
+                                       group_id, project_id) is None:
+        raise ValueError(f"unknown group {group_id}")
+
+
+def _insert(db: DB, item_id: str, project_id: int, position: int, title: str,
+            description: str, deps: list[str], kind: str = "", group_id: int | None = None,
+            type_: str = "item") -> None:
+    ts = now()
+    db.run("INSERT INTO items (id, project_id, position, title, description, depends_json, kind, "
+           "group_id, type, state_since, created_at, updated_at) "
+           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+           item_id, project_id, position, title, description, json.dumps(deps), kind, group_id,
+           type_, ts, ts, ts)
+
+
 def add_item(db: DB, project_id: int, title: str, description: str = "",
-             depends: list[str] | None = None, top: bool = False) -> str:
+             depends: list[str] | None = None, top: bool = False, group_id: int | None = None,
+             kind: str = "") -> str:
     title = title.strip()
     if not title:
         raise ValueError("title is required")
+    kind = _check_kind(kind)
     with db.tx():
         p = project(db, project_id)
         _check_depends(db, p, depends or [], None)
+        _check_group(db, p["id"], group_id)
         item_id = _next_id(db, p)
-        if top:
-            db.run("UPDATE items SET position = position + 1 WHERE project_id = ?", p["id"])
-            pos = 0
-        else:
-            pos = db.one("SELECT COALESCE(MAX(position) + 1, 0) FROM items WHERE project_id = ?",
-                         p["id"])[0]
-        ts = now()
-        db.run("INSERT INTO items (id, project_id, position, title, description, depends_json, "
-               "state_since, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               item_id, p["id"], pos, title, description.strip(), json.dumps(depends or []),
-               ts, ts, ts)
+        agg = "MIN(position) - 1" if top else "MAX(position) + 1"
+        pos = db.one(f"SELECT COALESCE({agg}, 0) FROM items WHERE project_id = ?", p["id"])[0]
+        _insert(db, item_id, p["id"], pos, title, description.strip(), depends or [], kind,
+                group_id)
         event(db, item_id, "created", "human", {"title": title})
     return item_id
 
 
-def edit_item(db: DB, item_id: str, title: str, description: str, depends: list[str]) -> None:
+def edit_item(db: DB, item_id: str, title: str, description: str, depends: list[str],
+              kind: str | None = None, group_id: int | None | str = "keep") -> None:
     title = title.strip()
     if not title:
         raise ValueError("title is required")
     with db.tx():
         it = item(db, item_id)
         _check_depends(db, project(db, it["project_id"]), depends, item_id)
-        db.run("UPDATE items SET title = ?, description = ?, depends_json = ?, updated_at = ? "
-               "WHERE id = ?", title, description.strip(), json.dumps(depends), now(), item_id)
+        kind = it["kind"] if kind is None else _check_kind(kind)
+        gid = it["group_id"] if group_id == "keep" else group_id
+        _check_group(db, it["project_id"], gid)  # type: ignore[arg-type]
+        if gid != it["group_id"]:  # joins the end of its new group
+            pos = db.one("SELECT COALESCE(MAX(position) + 1, 0) FROM items WHERE project_id = ?",
+                         it["project_id"])[0]
+            db.run("UPDATE items SET position = ? WHERE id = ?", pos, item_id)
+        db.run("UPDATE items SET title = ?, description = ?, depends_json = ?, kind = ?, "
+               "group_id = ?, updated_at = ? WHERE id = ?", title, description.strip(),
+               json.dumps(depends), kind, gid, now(), item_id)
         event(db, item_id, "edited", "human", {})
 
 
 def move(db: DB, item_id: str, where: str) -> None:
-    """Reorder among the project's active items: up | down | top."""
+    """Reorder among the active items of the same group: up | down | top."""
     with db.tx():
         it = item(db, item_id)
-        order = [r["id"] for r in items(db, it["project_id"], active_only=True)]
+        peers = [r for r in items(db, it["project_id"], active_only=True)
+                 if r["group_id"] == it["group_id"]]
+        order = [r["id"] for r in peers]
         if item_id not in order:
             return
+        slots = sorted(r["position"] for r in peers)
         i = order.index(item_id)
         order.pop(i)
         j = {"up": max(i - 1, 0), "down": min(i + 1, len(order)), "top": 0}[where]
         order.insert(j, item_id)
-        _renumber(db, it["project_id"], order)
+        if len(set(slots)) < len(slots):  # duplicate positions: spread them out
+            slots = list(range(slots[0], slots[0] + len(slots)))
+        for pos, iid in zip(slots, order):
+            db.run("UPDATE items SET position = ? WHERE id = ?", pos, iid)
 
 
 def _renumber(db: DB, project_id: int, active_order: list[str]) -> None:
@@ -181,9 +234,15 @@ def _renumber(db: DB, project_id: int, active_order: list[str]) -> None:
 # --- roadmap markdown ---------------------------------------------------------
 
 def active_markdown(db: DB, project_id: int) -> str:
-    return roadmap.serialize([
-        roadmap.Entry(r["title"], r["id"], depends(r), r["description"])
-        for r in items(db, project_id, active_only=True)])
+    rows = items(db, project_id, active_only=True)
+    used = {r["group_id"] for r in rows}
+    shown = [g for g in groups(db, project_id) if g["id"] in used or not db.one(
+        "SELECT 1 FROM items WHERE group_id = ?", g["id"])]
+    return roadmap.serialize(roadmap.Roadmap(
+        preamble=project(db, project_id)["preamble"],
+        groups=[roadmap.Group(g["title"], g["description"]) for g in shown],
+        entries=[roadmap.Entry(r["title"], r["id"], depends(r), r["description"], kind=r["kind"],
+                               group=r["group_title"]) for r in rows]))
 
 
 class MissingItems(Exception):
@@ -194,6 +253,42 @@ class MissingItems(Exception):
         super().__init__(", ".join(ids))
 
 
+def _sync_groups(db: DB, project_id: int, rm: roadmap.Roadmap, replace: bool) -> dict[str, int]:
+    """Upsert the roadmap's groups; return title → id.
+
+    replace: the roadmap lists every group (markdown save): its order wins and
+    groups it leaves out are deleted once nothing refers to them. Otherwise
+    (import) new groups are appended and existing ones keep their place.
+    """
+    existing = {g["title"]: g for g in groups(db, project_id)}
+    base = 0 if replace else len(existing)
+    ids = {}
+    for i, g in enumerate(rm.groups):
+        if g.title in existing:
+            row = existing[g.title]
+            desc = g.description if replace or not row["description"] else row["description"]
+            pos = i if replace else row["position"]
+            db.run("UPDATE groups SET position = ?, description = ? WHERE id = ?", pos, desc,
+                   row["id"])
+            ids[g.title] = row["id"]
+        else:
+            cur = db.run("INSERT INTO groups (project_id, position, title, description) "
+                         "VALUES (?, ?, ?, ?)", project_id, base + i, g.title, g.description)
+            ids[g.title] = cur.lastrowid
+    if replace:  # groups left out go after the listed ones; _drop_empty_groups removes them
+        for title, row in existing.items():
+            if title not in ids:
+                db.run("UPDATE groups SET position = ? WHERE id = ?",
+                       len(rm.groups) + row["position"], row["id"])
+    return ids
+
+
+def _drop_empty_groups(db: DB, project_id: int, keep: set[int]) -> None:
+    db.run("DELETE FROM groups WHERE project_id = ? AND id NOT IN (SELECT DISTINCT group_id "
+           f"FROM items WHERE group_id IS NOT NULL) AND id NOT IN ({','.join('?' * len(keep))})",
+           project_id, *keep)
+
+
 def save_markdown(db: DB, project_id: int, text: str, park_missing: bool = False) -> list[str]:
     """Apply an edited active roadmap. Returns the IDs of newly created items.
 
@@ -201,23 +296,26 @@ def save_markdown(db: DB, project_id: int, text: str, park_missing: bool = False
     MissingItems when active items are left out and park_missing is False.
     """
     p = project(db, project_id)
-    entries = roadmap.parse(text, p["slug"])
+    rm = roadmap.parse(text, p["slug"])
     with db.tx():
         active = {r["id"]: r for r in items(db, project_id, active_only=True)}
         errors = []
-        for e in entries:
+        for e in rm.entries:
             if e.id and e.id not in active:
                 row = db.one("SELECT state FROM items WHERE id = ? AND project_id = ?", e.id,
                              project_id)
                 why = f"is {row['state']}" if row else "is unknown (remove the ID to add a new item)"
                 errors.append(roadmap.ParseError(e.line, f"{e.id} {why}"))
+            elif e.id and e.parked and active[e.id]["state"] in BUSY:
+                errors.append(roadmap.ParseError(e.line, f"{e.id} can't be parked while a run "
+                                                         "or merge is in progress"))
             for d in e.depends:
                 if db.one("SELECT 1 FROM items WHERE id = ? AND project_id = ?", d,
                           project_id) is None:
                     errors.append(roadmap.ParseError(e.line, f"unknown dependency {d}"))
         if errors:
             raise roadmap.RoadmapError(errors)
-        missing = [iid for iid in active if iid not in {e.id for e in entries}]
+        missing = [iid for iid in active if iid not in {e.id for e in rm.entries}]
         busy = [iid for iid in missing if active[iid]["state"] in BUSY]
         if busy:
             raise roadmap.RoadmapError([roadmap.ParseError(
@@ -225,29 +323,101 @@ def save_markdown(db: DB, project_id: int, text: str, park_missing: bool = False
         if missing and not park_missing:
             raise MissingItems(missing)
 
+        db.run("UPDATE projects SET preamble = ? WHERE id = ?", rm.preamble, project_id)
+        gids = _sync_groups(db, project_id, rm, replace=True)
         created, order = [], []
         ts = now()
-        for e in entries:
+        for e in rm.entries:
+            gid = gids.get(e.group) if e.group else None
             if e.id is None:
                 e.id = _next_id(db, p)
-                db.run("INSERT INTO items (id, project_id, position, title, description, "
-                       "depends_json, state_since, created_at, updated_at) "
-                       "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)",
-                       e.id, project_id, e.title, e.description, json.dumps(e.depends), ts, ts, ts)
+                _insert(db, e.id, project_id, 0, e.title, e.description, e.depends, e.kind, gid)
                 event(db, e.id, "created", "human", {"title": e.title})
                 created.append(e.id)
             else:
                 old = active[e.id]
-                if (old["title"], old["description"], depends(old)) != \
-                        (e.title, e.description, e.depends):
+                if (old["title"], old["description"], depends(old), old["kind"],
+                        old["group_id"]) != (e.title, e.description, e.depends, e.kind, gid):
                     db.run("UPDATE items SET title = ?, description = ?, depends_json = ?, "
-                           "updated_at = ? WHERE id = ?",
-                           e.title, e.description, json.dumps(e.depends), ts, e.id)
+                           "kind = ?, group_id = ?, updated_at = ? WHERE id = ?",
+                           e.title, e.description, json.dumps(e.depends), e.kind, gid, ts, e.id)
                     event(db, e.id, "edited", "human", {})
+            if e.parked:
+                transition(db, e.id, "parked", "human", data={"reason": "marked parked"})
             order.append(e.id)
         for iid in missing:
             transition(db, iid, "parked", "human", data={"reason": "removed from roadmap"})
         _renumber(db, project_id, order)
+        _drop_empty_groups(db, project_id, set(gids.values()))
+    return created
+
+
+# --- imports --------------------------------------------------------------------
+
+def add_import(db: DB, project_id: int, instructions: str = "") -> str:
+    """An import item: its plan is a proposed roadmap, applied when approved."""
+    with db.tx():
+        p = project(db, project_id)
+        n = db.one("SELECT COUNT(*) FROM items WHERE project_id = ? AND type = 'import'",
+                   project_id)[0] + 1
+        item_id = f"{p['slug']}-IMPORT-{n}"
+        _insert(db, item_id, project_id, 0, "Import roadmap", instructions.strip(), [],
+                type_="import")
+        event(db, item_id, "created", "human", {"title": "Import roadmap"})
+    return item_id
+
+
+def check_import(db: DB, project_id: int, text: str, strict: bool = True) -> roadmap.Roadmap:
+    """Validate a proposed import. IDs in it are provisional labels for new items;
+    dependencies may point at them (they win) or at existing items.
+
+    strict (Claude's output): provisional IDs must not reuse existing ones, so a
+    dependency is never ambiguous when proposed. Off when applying, since items
+    added while the proposal waited may have taken those numbers.
+    """
+    p = project(db, project_id)
+    rm = roadmap.parse(text, p["slug"])
+    existing = {r["id"] for r in db.all("SELECT id FROM items WHERE project_id = ?", project_id)}
+    provisional = {e.id for e in rm.entries if e.id}
+    errors = []
+    for e in rm.entries:
+        if strict and e.id in existing:
+            errors.append(roadmap.ParseError(
+                e.line, f"{e.id} already exists; imported items are all new, so number them "
+                        f"from {roadmap.format_id(p['slug'], p['next_id'])}"))
+        for d in e.depends:
+            if d not in provisional and d not in existing:
+                errors.append(roadmap.ParseError(e.line, f"unknown dependency {d}"))
+    if not rm.entries:
+        errors.append(roadmap.ParseError(0, "the roadmap has no items"))
+    if errors:
+        raise roadmap.RoadmapError(sorted(errors, key=lambda x: x.line))
+    return rm
+
+
+def apply_import(db: DB, project_id: int, text: str, source: str) -> list[str]:
+    """Add an approved import's items (fresh IDs, dependencies remapped) after the
+    existing roadmap. A non-empty preamble replaces the project's."""
+    rm = check_import(db, project_id, text, strict=False)
+    with db.tx():
+        p = project(db, project_id)
+        if rm.preamble:
+            db.run("UPDATE projects SET preamble = ? WHERE id = ?", rm.preamble, project_id)
+        gids = _sync_groups(db, project_id, rm, replace=False)
+        ids = {e.id: _next_id(db, p) for e in rm.entries if e.id}
+        pos = db.one("SELECT COALESCE(MAX(position) + 1, 0) FROM items WHERE project_id = ?",
+                     project_id)[0]
+        created = []
+        for e in rm.entries:
+            iid = ids[e.id] if e.id else _next_id(db, p)
+            _insert(db, iid, project_id, pos, e.title, e.description,
+                    [ids.get(d, d) for d in e.depends], e.kind,
+                    gids[e.group] if e.group else None)
+            pos += 1
+            event(db, iid, "created", "human", {"title": e.title, "import": source})
+            if e.parked:
+                transition(db, iid, "parked", "human", data={"reason": "parked on import"})
+            created.append(iid)
     return created
 
 

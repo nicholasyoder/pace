@@ -1,5 +1,6 @@
 """Routes through FastAPI's TestClient, with real runs against fake_claude."""
 
+import json
 import re
 
 import pytest
@@ -82,8 +83,8 @@ def test_double_approve_is_refused(client, db, runner, scenario, item):
 def test_roadmap_markdown_edit(client, db, project, item):
     page = client.get("/p/TOY/roadmap").text
     assert "## TOY-001: Greet many" in page
-    r = post(client, "/p/TOY/roadmap", text="junk\n## TOY-001: Greet many\n")
-    assert r.status_code == 400 and "line 1" in r.text
+    r = post(client, "/p/TOY/roadmap", text="## TOY-001: Greet many\n- kind: Two Words\n")
+    assert r.status_code == 400 and "line 2" in r.text
     r = post(client, "/p/TOY/roadmap", text="## Something else\n")
     assert r.status_code == 409 and "leaves out TOY-001" in r.text
     r = post(client, "/p/TOY/roadmap", text="## Something else\n", park_missing="1")
@@ -156,3 +157,29 @@ def test_alias_and_local_origins_get_no_key(client, db, cfg, project):
     assert not (cfg.data_dir / "keys").exists()
     assert it.project(db, "AL")["origin"] == "git@github-nkms:a/b.git"
     assert "Deploy key" not in client.get("/p/AL/settings").text
+
+
+def test_import_through_ui(client, db, runner, scenario, project):
+    md = "# v0.4\nRelease.\n\n## TOY-001: Export\n- kind: debt\n\n## TOY-002: Docs\n- depends: TOY-001\n"
+    scenario("plan_ready " + json.dumps({"roadmap_markdown": md, "notes": "Read **ROADMAP.md**."}))
+    page = client.get("/p/TOY").text
+    assert "Start import" in page and "<details class=\"panel import-box\" open>" in page
+    r = post(client, "/p/TOY/import", runner, instructions="docs/roadmap only")
+    assert r.headers["location"] == "/i/TOY-IMPORT-1"
+    page = client.get("/i/TOY-IMPORT-1").text
+    assert "Apply to roadmap" in page and "<strong>ROADMAP.md</strong>" in page
+    assert "2 items in 1 group" in page and "Export" in page
+    assert "Roadmap import" in client.get("/p/TOY").text  # banner while it's open
+
+    post(client, "/i/TOY-IMPORT-1/approve", runner)
+    page = client.get("/p/TOY").text
+    assert "v0.4" in page and "TOY-001" in page and "badge kind\">debt" in page
+    assert "Roadmap import" not in page
+
+    gid = it.groups(db, project["id"])[0]["id"]
+    post(client, "/i/TOY-002/edit", title="Docs", description="", depends="TOY-001", kind="chore",
+         group_id="")
+    row = it.item(db, "TOY-002")
+    assert (row["kind"], row["group_id"]) == ("chore", None)
+    post(client, "/p/TOY/items", title="Late", group_id=str(gid))
+    assert it.item(db, "TOY-003")["group_id"] == gid

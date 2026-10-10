@@ -150,3 +150,15 @@ pre.small { font-size: .75rem; padding: 4px 8px; margin: 2px 0; }
   .card-head { flex-wrap: wrap; }
   .nav { gap: 10px; }
 }
+
+/* groups & imports */
+.badge.kind { color: var(--fg); background: var(--code); }
+.group-title { margin: 22px 0 4px; }
+.group-desc { margin: 0 0 4px; }
+.preamble { margin: 8px 0; }
+.import-box { margin-top: 24px; }
+.group-select { width: auto; max-width: 40%; }
+ol.preview { padding-left: 1.4em; }
+ol.preview li { margin: 2px 0; }
+ol.preview details { margin: 0; }
+ol.preview summary { font-weight: normal; }

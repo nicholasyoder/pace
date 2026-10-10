@@ -178,3 +178,48 @@ def test_recover_after_restart(db, runner, item):
     runner.recover()
     assert state(db, item) == "failed"
     assert db.one("SELECT status FROM runs")["status"] == "interrupted"
+
+
+ROADMAP = ("Order is a suggestion.\n\n# Tier 2\nRealism.\n\n## TOY-001: Shadows\n\n"
+           "## TOY-002: Skybox\n- depends: TOY-001\n- kind: debt\n\n# Someday\n\n## TOY-003: Net\n- parked\n")
+
+
+def test_import_flow(tmp_path, db, runner, scenario, project):
+    q = {"id": "q1", "text": "Split rendering polish?", "why_it_matters": "granularity",
+         "options": [{"id": "a", "label": "Split", "description": "one per feature"}],
+         "recommended": "a", "allow_free_text": True}
+    scenario(
+        f'plan_needs_input {json.dumps({"questions": [q], "roadmap_markdown": "draft"})}',
+        # invalid on purpose: unknown dependency → one retry with the parser's errors
+        "plan_ready " + json.dumps({"roadmap_markdown": "## TOY-001: x\n- depends: TOY-050\n"}),
+        f'plan_ready {json.dumps({"roadmap_markdown": ROADMAP, "notes": "Read docs/roadmap."})}',
+    )
+    imp = act.start_import(runner, project["id"], "Look in docs/roadmap.")
+    runner.wait()
+    assert state(db, imp) == "needs_input"
+    first = calls(tmp_path)[0]["argv"]
+    prompt = first[first.index("-p") + 1]
+    assert "Look in docs/roadmap." in prompt and "`TOY-001`, `TOY-002`" in prompt
+    assert "--permission-mode" in first and "roadmap_markdown" in first[first.index("--json-schema") + 1]
+    assert it.items(db, project["id"]) == []  # the import isn't a roadmap item
+
+    go(runner, act.answer, imp, {"q1": "a"})
+    assert state(db, imp) == "plan_ready"
+    retry = calls(tmp_path)[-1]["argv"]
+    assert "unknown dependency TOY-050" in retry[retry.index("-p") + 1]
+
+    go(runner, act.approve, imp)
+    assert state(db, imp) == "merged"
+    rows = it.items(db, project["id"])
+    assert [(r["id"], r["title"], r["group_title"], r["kind"], r["state"]) for r in rows] == [
+        ("TOY-001", "Shadows", "Tier 2", "", "backlog"),
+        ("TOY-002", "Skybox", "Tier 2", "debt", "backlog"),
+        ("TOY-003", "Net", "Someday", "", "parked")]
+    assert it.project(db, project["id"])["preamble"] == "Order is a suggestion."
+
+    # planning an imported item gets the roadmap and group context
+    scenario("plan_ready")
+    go(runner, act.plan, "TOY-001")
+    prompt = calls(tmp_path)[-1]["argv"]
+    text = prompt[prompt.index("-p") + 1]
+    assert "Order is a suggestion." in text and "## Part of: Tier 2\n\nRealism." in text

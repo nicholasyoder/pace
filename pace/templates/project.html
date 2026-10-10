@@ -1,34 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ project.name }} · PACE{% endblock %}
 {% block live %}<div data-sse="/events/global" hidden></div>{% endblock %}
-{% block content %}
-<div class="row wrap">
-  <h1>{{ project.name }} <span class="muted">{{ project.slug }}</span></h1>
-  <span class="spacer"></span>
-  <a class="button" href="/p/{{ project.slug }}/roadmap">Edit as markdown</a>
-  <a class="button" href="/p/{{ project.slug }}/settings">Settings</a>
-</div>
-<p class="muted">{{ project.origin }} · {{ project.base_branch }} · {{ project.merge_mode }} / {{ project.merge_strategy }}{% if project.paused %} · <strong>paused</strong>{% endif %}</p>
-
-{% if needs_key %}<div class="flash">PACE can't reach the repo yet. <a href="/p/{{ project.slug }}/settings#deploy-key">Add the deploy key on GitHub</a> before planning anything.</div>{% endif %}
-<form method="post" action="/p/{{ project.slug }}/items" class="quick-add">
-  <input type="text" name="title" placeholder="Quick add: one line becomes an item" required>
-  <label class="check"><input type="checkbox" name="top" value="1"> top</label>
-  <button>Add</button>
-</form>
-
-<nav class="filter">
-  <a href="/p/{{ project.slug }}" {% if show == 'active' %}class="on"{% endif %}>Active</a>
-  <a href="/p/{{ project.slug }}?show=all" {% if show != 'active' %}class="on"{% endif %}>All (incl. merged &amp; parked)</a>
-</nav>
-
-<ol id="roadmap" class="roadmap">
-{% for r in rows %}
+{% macro item_row(r) %}
   <li class="state-row-{{ r.state }}">
     <div class="rm-main">
       <a href="/i/{{ r.id }}"><span class="id">{{ r.id }}</span> {{ r.title }}</a>
       <div class="row wrap small">
         <span class="badge state-{{ r.state }}">{{ r.state|replace('_', ' ') }}</span>
+        {% if r.kind %}<span class="badge kind">{{ r.kind }}</span>{% endif %}
         {% if r.reverify %}<span class="badge warn">re-verify</span>{% endif %}
         {% if unmet.get(r.id) %}<span class="muted">waiting on {{ unmet[r.id]|join(', ') }}</span>{% endif %}
       </div>
@@ -39,13 +18,77 @@
       {% endif %}
       {% if r.state not in ('merged', 'parked') %}
       {% for where, label in [('top', '⤒'), ('up', '↑'), ('down', '↓')] %}
-        <button class="small" title="move {{ where }}" hx-post="/i/{{ r.id }}/move" hx-vals='{"where": "{{ where }}", "next": "/p/{{ project.slug }}"}' hx-target="#roadmap" hx-select="#roadmap" hx-swap="outerHTML">{{ label }}</button>
+        <button class="small" title="move {{ where }} within its group" hx-post="/i/{{ r.id }}/move" hx-vals='{"where": "{{ where }}", "next": "/p/{{ project.slug }}{% if show != 'active' %}?show=all{% endif %}"}' hx-target="#roadmap" hx-select="#roadmap" hx-swap="outerHTML">{{ label }}</button>
       {% endfor %}
       {% endif %}
     </div>
   </li>
-{% else %}
-  <li class="empty">No items. Quick-add one above, or edit as markdown.</li>
+{% endmacro %}
+{% block content %}
+<div class="row wrap">
+  <h1>{{ project.name }} <span class="muted">{{ project.slug }}</span></h1>
+  <span class="spacer"></span>
+  <a class="button" href="/p/{{ project.slug }}/roadmap">Edit as markdown</a>
+  <a class="button" href="/p/{{ project.slug }}/settings">Settings</a>
+</div>
+<p class="muted">{{ project.origin }} · {{ project.base_branch }} · {{ project.merge_mode }} / {{ project.merge_strategy }}{% if project.paused %} · <strong>paused</strong>{% endif %}</p>
+
+{% if needs_key %}<div class="flash">PACE can't reach the repo yet. <a href="/p/{{ project.slug }}/settings#deploy-key">Add the deploy key on GitHub</a> before planning anything.</div>{% endif %}
+
+{% for imp in imports if imp.state != 'merged' %}
+<a class="card" href="/i/{{ imp.id }}">
+  <div class="card-head"><span class="title">Roadmap import</span> <span class="badge state-{{ imp.state }}">{{ imp.state|replace('_', ' ') }}</span>
+    <span class="spacer"></span><span class="muted">{{ imp.state_since|age }}</span></div>
+  {% if imp.summary %}<div class="card-body">{{ imp.summary }}</div>{% endif %}
+</a>
 {% endfor %}
-</ol>
+
+<form method="post" action="/p/{{ project.slug }}/items" class="quick-add">
+  <input type="text" name="title" placeholder="Quick add: one line becomes an item" required>
+  {% if groups %}
+  <select name="group_id" title="group" class="group-select">
+    <option value="">(ungrouped)</option>
+    {% set used = rows|map(attribute='group_id')|select|list %}
+    {% set default = (groups|selectattr('id', 'in', used)|list or groups)|last %}
+    {% for g in groups %}<option value="{{ g.id }}" {% if g.id == default.id %}selected{% endif %}>{{ g.title }}</option>{% endfor %}
+  </select>
+  {% endif %}
+  <label class="check"><input type="checkbox" name="top" value="1"> top</label>
+  <button>Add</button>
+</form>
+
+<nav class="filter">
+  <a href="/p/{{ project.slug }}" {% if show == 'active' %}class="on"{% endif %}>Active</a>
+  <a href="/p/{{ project.slug }}?show=all" {% if show != 'active' %}class="on"{% endif %}>All (incl. merged &amp; parked)</a>
+</nav>
+
+<div id="roadmap">
+{% if project.preamble %}
+<details class="preamble"><summary>Roadmap context <span class="muted small">(sent with every item)</span></summary><div class="md">{{ project.preamble|md }}</div></details>
+{% endif %}
+{% set ungrouped = rows|selectattr('group_id', 'none')|list %}
+{% if ungrouped %}<ol class="roadmap">{% for r in ungrouped %}{{ item_row(r) }}{% endfor %}</ol>{% endif %}
+{% for g in groups %}
+  {% set members = rows|selectattr('group_id', 'equalto', g.id)|list %}
+  {% if members or show != 'active' %}
+  <h2 class="group-title">{{ g.title }} <span class="muted">{{ members|length }}</span></h2>
+  {% if g.description %}<details class="group-desc"><summary class="muted small">Group context</summary><div class="md">{{ g.description|md }}</div></details>{% endif %}
+  <ol class="roadmap">{% for r in members %}{{ item_row(r) }}{% else %}<li class="empty">No items.</li>{% endfor %}</ol>
+  {% endif %}
+{% endfor %}
+{% if not rows %}
+<p class="empty">No items yet. Quick-add one above, write the roadmap as markdown, or import the repo's existing roadmap below.</p>
+{% endif %}
+</div>
+
+<details class="panel import-box" {% if not rows and not imports %}open{% endif %}>
+  <summary><strong>Import roadmap</strong> <span class="muted">— Claude converts the repo's existing roadmap docs</span></summary>
+  <form method="post" action="/p/{{ project.slug }}/import" class="stack">
+    <p class="muted">Claude reads the repo (read-only), asks questions where the conversion needs a decision, and proposes a roadmap. You review it like a plan: send feedback until it's right, then apply it. Nothing in the repo changes.</p>
+    <textarea name="instructions" rows="4" placeholder="Optional: where to look, what to leave out, or paste a roadmap here directly."></textarea>
+    <div class="actions"><button class="primary">Start import</button></div>
+  </form>
+  {% set past = imports|selectattr('state', 'equalto', 'merged')|list %}
+  {% if past %}<p class="muted small">Earlier imports: {% for i in past %}<a href="/i/{{ i.id }}">{{ i.id }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+</details>
 {% endblock %}

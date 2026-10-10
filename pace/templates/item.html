@@ -10,6 +10,9 @@
   <h1><span class="id">{{ item.id }}</span> {{ item.title }}</h1>
   <div class="row wrap">
     <span class="badge state-{{ item.state }}">{{ item.state|replace('_', ' ') }}</span>
+    {% if item.type == 'import' %}<span class="badge">roadmap import</span>{% endif %}
+    {% if item.group_title %}<span class="badge">{{ item.group_title }}</span>{% endif %}
+    {% if item.kind %}<span class="badge kind">{{ item.kind }}</span>{% endif %}
     <span class="muted" title="{{ item.state_since }}">for {{ item.state_since|age }}</span>
     {% if item.reverify %}<span class="badge warn" title="Claude resolved merge conflicts after your last test">re-verify</span>{% endif %}
     {% for d, row in deps %}
@@ -105,8 +108,49 @@
 </section>
 {% endif %}
 
+{# ---------- proposed roadmap (imports) ---------- #}
+{% if item.type == 'import' and plans %}
+<section class="panel">
+  <h2>Proposed roadmap <span class="muted">v{{ plans[0].version }}</span></h2>
+  {% if item.state == 'needs_input' %}<p class="muted">Draft; Claude will revise it after your answers.</p>{% endif %}
+  {% if notes %}<details {% if item.state == 'plan_ready' %}open{% endif %}><summary>Claude's notes on the conversion</summary><div class="md">{{ notes|md }}</div></details>{% endif %}
+  {% if preview %}
+    {% set n_items = preview.entries|length %}
+    <p class="muted">{{ n_items }} item{{ '' if n_items == 1 else 's' }}{% if preview.groups %} in {{ preview.groups|length }} group{{ '' if preview.groups|length == 1 else 's' }}{% endif %}{% set parked = preview.entries|selectattr('parked')|list|length %}{% if parked %}, {{ parked }} parked{% endif %}. IDs are provisional; final IDs are assigned on apply.</p>
+    {% if preview.preamble %}<details><summary>Roadmap context (preamble)</summary><div class="md">{{ preview.preamble|md }}</div></details>{% endif %}
+    {% macro pv(e) %}<li>
+      <details><summary><span class="id">{{ e.id or 'new' }}</span> {{ e.title }}
+        {% if e.kind %}<span class="badge kind">{{ e.kind }}</span>{% endif %}
+        {% if e.parked %}<span class="badge">parked</span>{% endif %}
+        {% if e.depends %}<span class="muted small">← {{ e.depends|join(', ') }}</span>{% endif %}</summary>
+        <div class="md">{{ e.description|md }}</div></details></li>{% endmacro %}
+    {% set loose = preview.entries|selectattr('group', 'none')|list %}
+    {% if loose %}<ol class="preview">{% for e in loose %}{{ pv(e) }}{% endfor %}</ol>{% endif %}
+    {% for grp in preview.groups %}
+      <h3>{{ grp.title }}</h3>
+      {% if grp.description %}<div class="md muted small">{{ grp.description|md }}</div>{% endif %}
+      <ol class="preview">{% for e in preview.entries if e.group == grp.title %}{{ pv(e) }}{% endfor %}</ol>
+    {% endfor %}
+  {% elif preview_errors %}
+    <div class="flash error">This draft doesn't parse yet:<ul>{% for e in preview_errors %}<li>{{ e }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  {% if plan_diff and item.state == 'plan_ready' %}
+  <details><summary>Changes since v{{ plans[1].version }}</summary><pre class="diff">{{ plan_diff|diff }}</pre></details>
+  {% endif %}
+  <details><summary>As markdown</summary><pre class="wrap">{{ plans[0].markdown }}</pre></details>
+  {% if item.state == 'plan_ready' %}
+  <div class="actions">{{ act('approve', 'Apply to roadmap', 'primary') }} {{ act('park', 'Park') }}</div>
+  <form method="post" action="/i/{{ item.id }}/revise" class="stack">
+    <textarea name="feedback" rows="3" placeholder="Feedback on the proposal (split X, drop Y, group by release…); Claude revises it."></textarea>
+    <div class="actions"><button>Send feedback</button></div>
+  </form>
+  {% endif %}
+  {% if item.state == 'merged' %}<p class="muted">Applied.</p>{% endif %}
+</section>
+{% endif %}
+
 {# ---------- plan ---------- #}
-{% if plans %}
+{% if plans and item.type != 'import' %}
 <section class="panel">
   <h2>Plan <span class="muted">v{{ plans[0].version }}</span></h2>
   {% if item.state == 'needs_input' %}<p class="muted">Draft; Claude will revise it after your answers.</p>{% endif %}
@@ -137,13 +181,22 @@
 
 {# ---------- description ---------- #}
 <section class="panel">
-  <h2>Description</h2>
+  <h2>{{ 'Instructions' if item.type == 'import' else 'Description' }}</h2>
   {% if item.description %}<div class="md">{{ item.description|md }}</div>{% else %}<p class="muted">No description.</p>{% endif %}
   {% if item.state != 'merged' %}
   <details><summary>Edit</summary>
     <form method="post" action="/i/{{ item.id }}/edit" class="stack">
       <label>Title <input type="text" name="title" value="{{ item.title }}" required></label>
+      {% if item.type != 'import' %}
       <label>Depends on <input type="text" name="depends" value="{{ (item.depends_json|fromjson)|join(', ') }}" placeholder="{{ project.slug }}-003, …"></label>
+      <div class="grid2">
+        <label>Group <select name="group_id">
+          <option value="">(ungrouped)</option>
+          {% for grp in groups %}<option value="{{ grp.id }}" {% if grp.id == item.group_id %}selected{% endif %}>{{ grp.title }}</option>{% endfor %}
+        </select></label>
+        <label>Kind <input type="text" name="kind" value="{{ item.kind }}" placeholder="feature (default), debt, …"></label>
+      </div>
+      {% endif %}
       <label>Description <textarea name="description" rows="10">{{ item.description }}</textarea></label>
       <div class="actions"><button>Save</button></div>
     </form>

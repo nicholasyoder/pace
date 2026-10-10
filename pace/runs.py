@@ -27,8 +27,9 @@ from pace.bus import Bus
 from pace.config import Config
 from pace.db import DB, now
 from pace.prompts import render
+from pace.roadmap import RoadmapError, format_id
 
-PLAN_KINDS = ("plan", "answers", "revise_plan")
+PLAN_KINDS = ("plan", "import", "answers", "revise_plan")
 IMPL_KINDS = ("implement", "address_feedback", "resolve_conflicts")
 
 
@@ -213,7 +214,7 @@ class Runner:
         session = item["session_id"]
         head_before = None
 
-        if kind == "plan":
+        if kind in ("plan", "import"):
             g.ensure_canonical(P)
             base = g.add_worktree(self.agent, P, item_id)
             session = None  # a plan run always starts a new conversation
@@ -242,7 +243,10 @@ class Runner:
 
     def _claude(self, run_id: int, item: sqlite3.Row, proj: sqlite3.Row, kind: str, prompt: str,
                 session: str | None, log: Path) -> dict:
-        schema = "plan" if kind in PLAN_KINDS else "implement"
+        if kind in PLAN_KINDS:
+            schema = "import" if item["type"] == "import" else "plan"
+        else:
+            schema = "implement"
         mode = "read_only" if kind in PLAN_KINDS else "write"
         item_id = item["id"]
         wt = git_project(self.cfg, proj).worktree(item_id)
@@ -266,27 +270,37 @@ class Runner:
                 self.db.kv_set("rate_limit", {**r.rate_limit, "seen_at": now()})
             return r
 
+        # one retry (§8.1), for a failed run or for output that breaks the contract
         r = invoke(prompt, session)
-        if not r.ok:
-            if is_rate_limited(r):
-                raise RunFailed(f"rate limited: {json.dumps(r.rate_limit)}", "rate_limited")
-            if r.exit_code < 0 or r.exit_code == 143:
-                raise RunFailed(f"run was stopped (exit {r.exit_code})")
-            if session and r.result_event is None:
-                why = "resume failed; starting a fresh session"
-                retry_prompt, session = self._fresh(item, prompt), None
-            else:
-                why = (r.stderr.strip()[-500:] or "no valid structured output in the result")
-                retry_prompt = (f"Your previous turn failed: {why}\n"
-                                "Report through the structured output.")
-                session = r.session_id or session
-            it.event(self.db, item_id, "run_retry", "system", {"run": run_id, "why": why})
-            r = invoke(retry_prompt, session)
+        for attempt in (1, 2):
             if not r.ok:
                 if is_rate_limited(r):
                     raise RunFailed(f"rate limited: {json.dumps(r.rate_limit)}", "rate_limited")
-                raise RunFailed("run failed twice: "
-                                f"{r.stderr.strip()[-500:] or 'no valid structured output'}")
+                if r.exit_code < 0 or r.exit_code == 143:
+                    raise RunFailed(f"run was stopped (exit {r.exit_code})")
+                if attempt == 2:
+                    raise RunFailed("run failed twice: "
+                                    f"{r.stderr.strip()[-500:] or 'no valid structured output'}")
+                if session and r.result_event is None:
+                    why = "resume failed; starting a fresh session"
+                    retry_prompt, session = self._fresh(item, prompt), None
+                else:
+                    why = (r.stderr.strip()[-500:] or "no valid structured output in the result")
+                    retry_prompt = (f"Your previous turn failed: {why}\n"
+                                    "Report through the structured output.")
+                    session = r.session_id or session
+            else:
+                problem = self._validate(item, r.structured_output)  # type: ignore[arg-type]
+                if problem is None:
+                    break
+                if attempt == 2:
+                    raise RunFailed(f"contract violation (after one retry): {problem}")
+                why = problem
+                retry_prompt = (f"PACE rejected your output: {problem}\n"
+                                "Fix it and report again through the structured output.")
+                session = r.session_id or session
+            it.event(self.db, item_id, "run_retry", "system", {"run": run_id, "why": why})
+            r = invoke(retry_prompt, session)
 
         if mode == "read_only" and not g.is_clean(self.agent, wt):
             g.reset_worktree(self.agent, wt)
@@ -307,6 +321,24 @@ class Runner:
         it.update(self.db, item_id, session_id=r.session_id)
         return r.structured_output  # type: ignore[return-value]
 
+    def _validate(self, item: sqlite3.Row, out: dict) -> str | None:
+        """Contract checks beyond the JSON schema; the message goes back to Claude."""
+        status = out.get("status")
+        if status == "needs_input" and not out.get("questions"):
+            return "status is needs_input but there are no questions"
+        if item["type"] == "import":
+            md = (out.get("roadmap_markdown") or "").strip()
+            if status == "plan_ready":
+                if not md:
+                    return "status is plan_ready but roadmap_markdown is empty"
+                try:
+                    it.check_import(self.db, item["project_id"], md)
+                except RoadmapError as e:
+                    return f"roadmap_markdown doesn't pass the PACE roadmap parser:\n{e}"
+        elif status == "plan_ready" and not (out.get("plan_markdown") or "").strip():
+            return "status is plan_ready but plan_markdown is empty"
+        return None
+
     # --- prompts --------------------------------------------------------------------
 
     def _prompt(self, kind: str, item: sqlite3.Row, proj: sqlite3.Row, inputs: dict) -> str:
@@ -315,7 +347,18 @@ class Runner:
         if kind == "plan":
             return render("plan", item_id=item["id"], title=item["title"],
                           description=item["description"] or "(no description; ask if unclear)",
+                          context=self._context(item, proj),
                           dependencies=self._dependencies(item), extra_instructions=extra)
+        if kind == "import":
+            first, second = (format_id(proj["slug"], proj["next_id"] + i) for i in (0, 1))
+            notes = item["description"].strip()
+            current = it.active_markdown(self.db, proj["id"]).strip()
+            existing = (f"\n## The project's current PACE roadmap\n\nDon't duplicate these items. "
+                        f"New items may depend on them by ID.\n\n```markdown\n{current}\n```\n"
+                        if current else "")
+            return render("import", first_id=first, second_id=second, slug=proj["slug"],
+                          instructions=f"## Notes from the reviewer\n\n{notes}\n\n" if notes else "",
+                          existing=existing) + (f"\n{extra}\n" if extra else "")
         if kind == "answers":
             return render("answers", answers=inputs["answers"])
         if kind == "revise_plan":
@@ -333,6 +376,17 @@ class Runner:
                           base=proj["base_branch"], conflicts=inputs["conflicts"],
                           extra_instructions=extra)
         raise ValueError(f"unknown run kind {kind}")
+
+    def _context(self, item: sqlite3.Row, proj: sqlite3.Row) -> str:
+        """The roadmap preamble and the item's group description, if any."""
+        parts = []
+        if proj["preamble"].strip():
+            parts.append(f"## Roadmap context\n\n{proj['preamble'].strip()}")
+        if item["group_id"] is not None:
+            grp = self.db.one("SELECT * FROM groups WHERE id = ?", item["group_id"])
+            desc = f"\n\n{grp['description'].strip()}" if grp["description"].strip() else ""
+            parts.append(f"## Part of: {grp['title']}{desc}")
+        return ("\n" + "\n\n".join(parts) + "\n") if parts else ""
 
     def _dependencies(self, item: sqlite3.Row) -> str:
         parts = []
@@ -374,7 +428,8 @@ class Runner:
         # one transaction; _guard publishes the change once it's committed
         item_id = item["id"]
         with self.db.tx():
-            md = (out.get("plan_markdown") or "").strip()
+            field = "roadmap_markdown" if item["type"] == "import" else "plan_markdown"
+            md = (out.get(field) or "").strip()
             last = latest_plan(self.db, item_id)
             if md and (last is None or last["markdown"] != md):
                 self.db.run("INSERT INTO plans (item_id, version, markdown, affected_files_json, "

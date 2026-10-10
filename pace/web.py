@@ -25,6 +25,7 @@ from pace import actions as act
 from pace import git as g
 from pace import items as it
 from pace.db import now
+from pace import roadmap
 from pace.roadmap import RoadmapError
 from pace.runs import activity_line, git_project, latest_impl_output, latest_plan
 
@@ -192,19 +193,39 @@ def project_page(request: Request, slug: str, show: str = "active"):
              for r in rows if r["state"] in ("backlog", "approved")}
     key = deploy_key(request, p)
     return render(request, "project.html", project=p, rows=rows, show=show, unmet=unmet,
+                  groups=it.groups(db, p["id"]), imports=it.imports(db, p["id"]),
                   needs_key=bool(key and not (key["access"] or {}).get("ok")))
+
+
+@router.post("/p/{slug}/import")
+async def project_import(request: Request, slug: str):
+    p = get_project(request, slug)
+    form = await request.form()
+    try:
+        item_id = await asyncio.to_thread(act.start_import, request.app.state.runner, p["id"],
+                                          str(form.get("instructions", "")))
+    except act.ActionError as e:
+        return render(request, "project.html", 409, project=p, show="active", unmet={},
+                      rows=it.items(db_(request), p["id"], active_only=True),
+                      groups=it.groups(db_(request), p["id"]),
+                      imports=it.imports(db_(request), p["id"]), error=str(e))
+    return back(f"/i/{item_id}")
 
 
 @router.post("/p/{slug}/items")
 async def quick_add(request: Request, slug: str):
     p = get_project(request, slug)
     form = await request.form()
+    gid = str(form.get("group_id", ""))
     try:
         it.add_item(db_(request), p["id"], str(form.get("title", "")),
-                    str(form.get("description", "")), top=bool(form.get("top")))
+                    str(form.get("description", "")), top=bool(form.get("top")),
+                    group_id=int(gid) if gid else None)
     except ValueError as e:
         return render(request, "project.html", 400, project=p, show="active", unmet={},
-                      rows=it.items(db_(request), p["id"], active_only=True), error=str(e))
+                      rows=it.items(db_(request), p["id"], active_only=True),
+                      groups=it.groups(db_(request), p["id"]),
+                      imports=it.imports(db_(request), p["id"]), error=str(e))
     request.app.state.runner.publish("-")
     return back(f"/p/{slug}")
 
@@ -294,7 +315,18 @@ def item_context(request: Request, item_id: str) -> dict[str, Any]:
     deps = [(d, db.one("SELECT state, title FROM items WHERE id = ?", d)) for d in it.depends(item)]
     need = "approved" if item["state"] == "backlog" else "merged"
     events = list(reversed(it.events(db, item_id)))
-    return dict(item=item, project=proj, plans=plans, plan_diff=plan_diff, rounds=rounds,
+    preview = preview_errors = notes = None
+    if item["type"] == "import" and plans:
+        try:
+            preview = roadmap.parse(plans[0]["markdown"], proj["slug"])
+        except RoadmapError as e:
+            preview_errors = e.errors
+        last = db.one("SELECT output_json FROM runs WHERE item_id = ? AND status = 'succeeded' "
+                      "ORDER BY id DESC LIMIT 1", item_id)
+        notes = (json.loads(last["output_json"]) or {}).get("notes") if last else None
+    return dict(preview=preview, preview_errors=preview_errors, notes=notes,
+                groups=it.groups(db, proj["id"]),
+                item=item, project=proj, plans=plans, plan_diff=plan_diff, rounds=rounds,
                 open_round=open_round, impl=impl, diff=diff, diffstat=diffstat, log=log,
                 runs=runs, current=current, deps=deps, events=events,
                 live_lines=run_lines(current) if current else [],
@@ -315,9 +347,12 @@ async def item_edit(request: Request, item_id: str):
     get_item(request, item_id)
     form = await request.form()
     deps = [d.strip() for d in str(form.get("depends", "")).replace(",", " ").split() if d.strip()]
+    gid = str(form.get("group_id", "keep"))
     try:
         it.edit_item(db_(request), item_id, str(form.get("title", "")),
-                     str(form.get("description", "")), deps)
+                     str(form.get("description", "")), deps,
+                     kind=str(form["kind"]) if "kind" in form else None,
+                     group_id="keep" if gid == "keep" else int(gid) if gid else None)
     except ValueError as e:
         return render(request, "item.html", 400, error=str(e), **item_context(request, item_id))
     return back(f"/i/{item_id}")

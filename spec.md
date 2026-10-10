@@ -1,4 +1,4 @@
-# PACE — Spec (v0.4)
+# PACE — Spec (v0.5)
 
 **PACE** (Plan · Approve · Code · Evaluate). A personal, self-hosted orchestrator that turns per-project roadmaps into a steady pipeline of plans and implementations driven by Claude Code, and only interrupts me when a decision or a manual check is needed.
 
@@ -71,7 +71,7 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 - **Project**: a codebase, its roadmap and its settings.
 - **Item**: one roadmap entry, with a stable ID like `WEB-014` that is never reused.
-- **Run**: one `claude` invocation for an item. Kinds: `plan`, `answers` (the follow-up after I answer questions), `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, and `import` (not tied to an item).
+- **Run**: one `claude` invocation for an item. Kinds: `plan`, `import` (§6), `answers` (the follow-up after I answer questions), `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, and `import` (not tied to an item).
 - **Inbox entry**: derived from item state when I need to act (§7).
 
 ---
@@ -98,21 +98,42 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 ## 6. Roadmap
 
-**The DB is canonical.** The markdown format below is used for import, the "edit as markdown" view and export.
+**The DB is canonical.** The markdown format below is used for import, the "edit as markdown" view and export. The repo's own roadmap docs aren't touched; they stay as narrative and history.
 
 ```markdown
+Optional preamble: roadmap-wide context, sent with every planning run.
+
+## WEB-002: An ungrouped item (ungrouped items come first)
+
+# v0.4 — Reporting
+Optional group description: context for every item in the group.
+
 ## WEB-014: Add CSV export for reports
 - depends: WEB-003, WEB-009
+- kind: debt
+- parked
 
 Free-form markdown description: context, constraints, acceptance criteria.
-Everything until the next `## ` heading belongs to the item.
+Everything until the next `## ` or `# ` heading belongs to the item;
+headings inside it must be `###` or deeper.
 ```
 
-- **Order is priority.** Reorder to reprioritise; "move to top" bumps an item.
+- **Order is priority:** groups in order, then items within each group. Reorder to reprioritise; "move to top" bumps an item to the top of its group.
+- **Groups** are tiers, releases or milestones; PACE treats them all the same. A group's description and the preamble go into every plan prompt for its items. Groups with no active items are hidden from the active view, and a group nothing refers to is deleted on save.
+- **Metadata lines** come straight after the item heading, each at most once:
+  - `- depends:`
+  - `- kind:`, one lowercase word such as `debt`, shown as a badge
+  - `- parked`, which parks the item when the markdown is saved or imported
 - **Strict parser, no LLM.** A heading without an ID becomes a new item and gets the next ID (each project keeps a `next_id` counter). If a save leaves out an existing ID, the UI asks whether to park that item. Parse errors are shown with line numbers and nothing is saved until the markdown is valid.
-- **Editing:** a structured list (add, edit, reorder, park) plus a raw markdown view of the active items.
-- **Quick add:** one line becomes an item with that title. If it's underspecified, the planning run will ask.
-- **Import:** paste an existing roadmap or TODO. An `import` run (read-only Claude) converts it to this format. The UI shows the original and the result side by side; I edit and approve. Nothing is saved until I approve.
+- **Editing:** a structured list (add, edit, reorder within a group, park; the edit form sets group and kind) plus a raw markdown view of the active items.
+- **Quick add:** one line becomes an item with that title, added to a chosen group (by default the last visible one). If it's underspecified, the planning run will ask.
+- **Import** is an *import item* (`type = 'import'`, ID `<SLUG>-IMPORT-<n>`) that goes through the normal plan lifecycle:
+  - **Starting it:** "Import roadmap" on the project page, with optional notes (where to look, what to leave out, or a pasted roadmap). This starts an `import` run: read-only Claude in a worktree, with schema `import.json` (`roadmap_markdown`, `notes`, `questions`).
+  - **What Claude produces:** it reads the repo's roadmap material and skips done work. It splits umbrella entries into item-sized ones, maps tiers and releases to groups, and asks questions where the conversion needs a decision.
+  - **Validation:** the proposal must pass the strict parser. IDs are provisional (`next_id` onwards), and dependencies may also point at existing items. A proposal that fails gets one retry, with the parser errors sent back to Claude.
+  - **Review:** the item page shows Claude's notes and a structured preview, grouped, with kinds, dependencies and parked items. Feedback and answers resume the session.
+  - **Applying:** "Apply to roadmap" adds the items after the existing roadmap with fresh IDs and dependencies remapped. A non-empty preamble replaces the project's. The import then moves straight from `plan_ready` to `merged`; nothing is committed.
+  - **Visibility:** imports never appear in the roadmap list or the markdown view.
 - **Proposed items:** any run can propose new items or splits (§8.2). They appear in the inbox, where I accept them (they're added to the roadmap) or dismiss them.
 
 ---
@@ -264,8 +285,9 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 
 ## 12. Data model (SQLite)
 
-- `projects(id, slug, name, origin, base_branch, merge_mode, merge_strategy, plan_ahead, test_ahead, max_concurrent_implementations, model, extra_instructions, next_id, paused)`
-- `items(id TEXT PK, project_id, position, title, description, depends_json, state, state_since, attempts, session_id, branch, plan_base_commit, impl_base_commit, pr_url, stale_json, reverify, summary, last_error, created_at, updated_at)`
+- `projects(id, slug, name, origin, base_branch, merge_mode, merge_strategy, plan_ahead, test_ahead, max_concurrent_implementations, model, extra_instructions, preamble, next_id, paused)`
+- `groups(id, project_id, position, title, description)`
+- `items(id TEXT PK, project_id, type[item|import], group_id, kind, position, title, description, depends_json, state, state_since, attempts, session_id, branch, plan_base_commit, impl_base_commit, pr_url, stale_json, reverify, summary, last_error, created_at, updated_at)`
 - `plans(item_id, version, markdown, affected_files_json, created_at)`
 - `qa_rounds(item_id, round, questions_json, answers_json, answered_at)`
 - `runs(id, item_id, kind, input_json, status[queued|running|succeeded|failed|interrupted|rate_limited], pid, session_id, started_at, ended_at, exit_code, cost_usd, usage_json, output_json, log_path, error)`
@@ -297,7 +319,7 @@ Every state transition is a single transaction that also writes an `events` row.
 - **M0 — Spike (CLI, no UI). ✓ Done 2026-10-10.** `python -m pace.spike` took a toy item and nkms #24 through plan → questions → approve → implement as `pace-agent` → push → `merge-tree` squash merge. Findings are folded into this version. `fake_claude` replays recorded runs. `pace/agent.py`, `pace/git.py`, `pace/prompts/` and `pace/schemas/` carry into M1. `pace/spike.py` gets deleted once M1 replaces it.
 - **M1 — Core, end to end in local mode. ✓ Built 2026-10-10.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge, `address_feedback` and `resolve_conflicts`. It was proven with real `claude` as `pace-agent` on a toy repo through plan → implement → Problem → fix → squash merge. Not in M1: the System page (moves to M2) and the proposal inbox actions (M3; proposals are stored and shown on the item page, deduped by title). Runs as `dev` via `uv run python -m pace` until the `pace` user and a systemd unit arrive at the end of M2.
 - **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps, the System page, and the `pace` user plus a systemd unit.
-- **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, import, proposed items, stale-plan flag. Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
+- **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, proposed items, stale-plan flag. (Import, groups, kinds and the preamble came forward and were built 2026-10-10.) Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
 - **M4 — Phone pass.** Layout polish for phone use.
 
 **Acceptance:** with two projects (one `local`, one `pr`), I import a roadmap and leave PACE running. Later I find plans and questions in the inbox, answer and approve them, and later still find branches ready to test with clear manual checks. I can merge both ways from the UI and never need a terminal.

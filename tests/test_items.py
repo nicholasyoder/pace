@@ -117,3 +117,54 @@ def test_inbox_and_deps(db, proj):
     assert it.unmet_dependencies(db, it.item(db, b), "approved") == []
     assert it.unmet_dependencies(db, it.item(db, b), "merged") == [a]
     assert it.inbox(db) == []
+
+
+def test_groups_order_and_move(db, proj):
+    md = ("Be careful.\n\n## Loose\n\n# Tier 1\nFoundations.\n\n## A\n\n## B\n- kind: debt\n\n"
+          "# Tier 2\n\n## C\n")
+    it.save_markdown(db, proj["id"], md)
+    assert it.project(db, proj["id"])["preamble"] == "Be careful."
+    rows = it.items(db, proj["id"])
+    assert [(r["title"], r["group_title"], r["kind"]) for r in rows] == [
+        ("Loose", None, ""), ("A", "Tier 1", ""), ("B", "Tier 1", "debt"), ("C", "Tier 2", "")]
+    b = rows[2]["id"]
+    it.move(db, b, "top")  # top of its group, not of the roadmap
+    assert [r["title"] for r in it.items(db, proj["id"])] == ["Loose", "B", "A", "C"]
+    assert it.active_markdown(db, proj["id"]).startswith("Be careful.\n\n## WEB-001: Loose\n")
+
+    # reorder groups, drop the empty one, move an item across groups
+    t2 = next(g["id"] for g in it.groups(db, proj["id"]) if g["title"] == "Tier 2")
+    it.edit_item(db, b, "B", "", [], group_id=t2)
+    assert [r["title"] for r in it.items(db, proj["id"])] == ["Loose", "A", "C", "B"]
+    md = it.active_markdown(db, proj["id"]).replace("# Tier 1\nFoundations.\n\n## WEB-002: A\n", "")
+    it.save_markdown(db, proj["id"], md.replace("## WEB-001: Loose", "## WEB-002: A\n\n## WEB-001: Loose"))
+    assert [g["title"] for g in it.groups(db, proj["id"])] == ["Tier 2"]
+
+
+def test_parked_in_markdown(db, proj):
+    a = it.add_item(db, proj["id"], "A")
+    it.save_markdown(db, proj["id"], f"## {a}: A\n- parked\n\n## New\n- parked\n")
+    assert [r["state"] for r in it.items(db, proj["id"])] == ["parked", "parked"]
+    assert it.active_markdown(db, proj["id"]) == ""
+
+
+def test_import_check_and_apply(db, proj):
+    existing = it.add_item(db, proj["id"], "Existing")
+    imp = it.add_import(db, proj["id"], "use docs/roadmap")
+    assert imp == "WEB-IMPORT-1" and it.items(db, proj["id"]) [0]["id"] == existing
+    bad = "## WEB-001: clash\n\n## WEB-002: x\n- depends: WEB-077\n"
+    with pytest.raises(RoadmapError) as ei:
+        it.check_import(db, proj["id"], bad)
+    assert "already exists" in str(ei.value) and "unknown dependency WEB-077" in str(ei.value)
+
+    md = ("Framing.\n\n# v0.4\nRelease notes.\n\n## WEB-002: First\n- depends: WEB-001\n\n"
+          "## WEB-003: Second\n- depends: WEB-002\n- kind: debt\n\n# Someday\n\n## WEB-004: Net\n- parked\n")
+    it.add_item(db, proj["id"], "Sneaks in and takes WEB-002")
+    created = it.apply_import(db, proj["id"], md, imp)
+    assert created == ["WEB-003", "WEB-004", "WEB-005"]  # fresh IDs, deps remapped
+    assert it.depends(it.item(db, "WEB-003")) == ["WEB-001"]
+    assert it.depends(it.item(db, "WEB-004")) == ["WEB-003"]
+    assert it.item(db, "WEB-005")["state"] == "parked"
+    assert it.project(db, proj["id"])["preamble"] == "Framing."
+    assert [r["title"] for r in it.items(db, proj["id"], active_only=True)] == [
+        "Existing", "Sneaks in and takes WEB-002", "First", "Second"]
