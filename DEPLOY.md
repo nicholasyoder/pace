@@ -7,7 +7,7 @@ checkout in `/opt/pace`. It develops itself: a change PACE merges into
 ## Fresh VM
 
 ```sh
-git clone https://github.com/nicholasyoder/pace.git /tmp/pace   # or copy the scripts/ dir over
+# copy scripts/ over first (the repo is private): scp -r scripts newvm:/tmp/pace/
 sudo /tmp/pace/scripts/setup-vm.sh                 # packages, users, toolchains, sudoers, config
 sudo -u pace-agent -i ~pace-agent/.local/bin/claude   # /login once, then /exit
 sudo /tmp/pace/scripts/import-data.sh pace-data-….tar.gz   # only when moving from another VM
