@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from datetime import datetime
 
 import pytest
 
@@ -166,3 +167,28 @@ def test_loop_wakes_on_publish(db, runner, project, fake_start):
             await sched.stop()
 
     asyncio.run(main())
+
+
+def at(hh):
+    return datetime(2026, 10, 10, hh, 0).astimezone()
+
+
+def test_run_window_gates_the_scheduler(db, runner, cfg, project, fake_start):
+    cfg.run_windows, cfg.concurrency = ["22:00-08:00"], 1
+    a, b = add(db, project, "a"), add(db, project, "b")
+    assert tick(runner, now=at(12)) == []
+    assert tick(runner, now=at(23)) == [(a, "plan")]
+    fake_start.clear()  # a's slot frees up
+    assert tick(runner, now=at(3)) == [(b, "plan")]  # after midnight, still inside
+
+
+def test_window_closing_leaves_runs_and_manual_starts_alone(db, runner, cfg, project,
+                                                            fake_start):
+    cfg.run_windows = ["22:00-08:00"]
+    it.update_project(db, project["id"], plan_ahead=1)
+    a, b, c = add(db, project, "a"), add(db, project, "b"), add(db, project, "c")
+    assert tick(runner, now=at(23)) == [(a, "plan")]
+    assert tick(runner, now=at(12)) == []  # closed: nothing new
+    assert state(db, a) == "planning" and fake_start == [(a, "plan")]  # a keeps going
+    act.plan(runner, c)  # Plan now bypasses the window
+    assert fake_start == [(a, "plan"), (c, "plan")] and state(db, b) == "backlog"

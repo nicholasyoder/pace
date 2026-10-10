@@ -10,6 +10,8 @@ import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from pace import windows
+
 
 @dataclass
 class Config:
@@ -43,4 +45,13 @@ def load(path: Path | None = None) -> Config:
     for k in ("data_dir", "agent_home"):
         if k in raw:
             raw[k] = Path(raw[k])
+    if "run_windows" in raw:
+        rw = raw["run_windows"]
+        if not isinstance(rw, list) or not all(isinstance(w, str) for w in rw):
+            raise ValueError(f"{path}: run_windows must be a list of \"HH:MM-HH:MM\" strings")
+        for w in rw:
+            try:
+                windows.parse(w)
+            except ValueError as e:
+                raise ValueError(f"{path}: run_windows: {e}") from None
     return Config(**raw)

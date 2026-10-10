@@ -18,6 +18,9 @@ Check `/etc/pace/config.toml` (bind = the Tailscale IP). Without imported data,
 `deploy.sh` generates the PACE project's deploy key and stops: add it to the
 repo with write access and rerun.
 
+`run_windows` in the config uses the VM's local time. Check it with `timedatectl`
+and set it with `sudo timedatectl set-timezone <Area/City>` (then restart `pace`).
+
 ## Moving from another VM
 
 On the old VM: stop the server, then `scripts/export-data.sh /var/lib/pace` and
