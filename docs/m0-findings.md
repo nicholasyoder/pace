@@ -33,8 +33,30 @@ Probed with `claude` 2.1.296 on 2026-10-10, as `dev`, on a toy repo.
 Fixtures: `tests/fixtures/stream/plan_needs_input.jsonl`, `plan_ready_resumed.jsonl`.
 Schemas: `pace/schemas/{plan,implement}.json`.
 
+## Users, sudo, cwd (setup-vm.sh)
+- pace-agent has its own native `claude` install (`~pace-agent/.local/bin/claude`, auto-updates);
+  auth via interactive `/login` as pace-agent, so the credentials refresh themselves and no token goes through the env.
+- sudo's default `env_reset` + `secure_path` already scrub the env → no `env -i` wrapper (which
+  would have made `env` an allowed command, i.e. anything).
+- sudo keeps the caller's cwd; the agent can't stat PACE's dirs → always spawn sudo with cwd=`/`.
+- PACE can't chdir into the agent's 0700 worktree and claude has no `--cwd` → `sudo -D <worktree>`,
+  which needs `CWD=*` on the sudoers rule.
+- During M0 `dev` stands in for `pace` and has full sudo anyway; the scoped rule only bites once
+  a real `pace` user exists.
+
+## §15.3 git isolation → bundles, not fetch
+- Agent home is 0700, so PACE cannot read the agent clone at all — good: PACE's git never touches
+  a repo the agent controls (a local fetch would run upload-pack against agent-written config).
+- **Agent → PACE:** `sudo -u pace-agent git -C <wt> bundle create - pace/<ID> ^canon/<base>` to
+  stdout; PACE writes it to a file it owns, `git bundle verify`, then
+  `git fetch <file> +refs/heads/pace/<ID>:refs/heads/pace/<ID>` into the canonical repo. Tested ✓.
+- **PACE → agent:** agent trusts canonical via `safe.directory=/var/lib/pace/repos/*` in its global
+  git config (fine: canonical is PACE-owned and trusted).
+- Agent layout: bare clone `~/work/<slug>/repo.git` (remote `canon`, refspec
+  `+refs/heads/*:refs/remotes/canon/*`) with worktrees at `~/work/<slug>/wt/<ID>`.
+- Local-mode merge: `merge-tree --write-tree origin/<base> pace/<ID>` → `commit-tree -p <base>`
+  → push to origin. Tested ✓ against a local bare origin. (Commit identity needs setting for PACE.)
+
 ## Open
-- Plan → implement resume across permission modes (as pace-agent).
-- §15.2 headless auth for pace-agent.
-- §15.3 git isolation (upload-pack reads the agent repo's config; consider bundles).
+- Plan → implement resume across permission modes (as pace-agent) — needs the `CWD=*` rule.
 - Agent `~/.claude` contents; per-project auto-memory dir is created under `~/.claude/projects/<slug>/memory`.
