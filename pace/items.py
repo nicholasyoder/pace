@@ -434,6 +434,11 @@ def transition(db: DB, item_id: str, to: str, actor: str, *, expect: str | set[s
 
     `expect` guards against acting on a stale page (e.g. a double-clicked
     Approve): the item must currently be in that state / one of those states.
+
+    `attempts` (runs started in the current state, §9 rule 5) resets whenever
+    the item moves on, except into `failed` and when the system moves it out
+    of `failed` (re-queueing), so repeated failures add up. A human moving it
+    out of `failed` (Retry, back to backlog, park) resets it.
     """
     bad = set(fields) - ITEM_FIELDS
     if bad:
@@ -445,6 +450,9 @@ def transition(db: DB, item_id: str, to: str, actor: str, *, expect: str | set[s
             raise InvalidTransition(f"{item_id} is {frm}, not {expect}")
         if to not in ALLOWED[frm]:
             raise InvalidTransition(f"{item_id}: {frm} → {to} not allowed")
+        if "attempts" not in fields and to != "failed" and not (frm == "failed"
+                                                                and actor != "human"):
+            fields["attempts"] = 0
         ts = now()
         sets = ["state = ?", "state_since = ?", "updated_at = ?"] + [f"{k} = ?" for k in fields]
         db.run(f"UPDATE items SET {', '.join(sets)} WHERE id = ?",

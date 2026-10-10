@@ -61,6 +61,18 @@ def test_transitions_and_events(db, proj):
     assert kinds == [("created", None), ("state", "planning"), ("state", "failed")]
 
 
+def test_attempts_reset_rules(db, proj):
+    a = it.add_item(db, proj["id"], "A")
+    it.transition(db, a, "planning", "system")
+    it.update(db, a, attempts=2)
+    assert it.transition(db, a, "failed", "system")["attempts"] == 2  # failing keeps it
+    assert it.transition(db, a, "planning", "system")["attempts"] == 2  # re-queue keeps it
+    it.transition(db, a, "failed", "system")
+    assert it.transition(db, a, "planning", "human")["attempts"] == 0  # Retry resets
+    it.update(db, a, attempts=1)
+    assert it.transition(db, a, "plan_ready", "claude")["attempts"] == 0  # moved on
+
+
 def test_transition_rolls_back_with_outer_tx(db, proj):
     a = it.add_item(db, proj["id"], "A")
     with pytest.raises(RuntimeError):

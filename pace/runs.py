@@ -5,6 +5,10 @@ The caller (an action) has already moved the item into `planning`,
 Claude, and applies the result as the next transition. Any failure moves the
 item to `failed` with the reason; Retry re-runs the same kind with the same
 inputs.
+
+Every run or merge start counts as an attempt in the item's current state
+(§9 rule 5); a start past MAX_ATTEMPTS is refused and fails the item. The
+count resets when the item moves on (see items.transition) and on Retry.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from pace.roadmap import RoadmapError, format_id
 
 PLAN_KINDS = ("plan", "import", "answers", "revise_plan")
 IMPL_KINDS = ("implement", "address_feedback", "resolve_conflicts")
+MAX_ATTEMPTS = 3
 
 
 class RunFailed(RuntimeError):
@@ -199,9 +204,21 @@ class Runner:
         it.transition(self.db, item_id, to, actor, **kw)
         self.publish(item_id)
 
+    def _attempt(self, item_id: str) -> None:
+        """Count a start in the item's current state; refuse it past MAX_ATTEMPTS."""
+        with self.db.tx():
+            self.db.run("UPDATE items SET attempts = attempts + 1 WHERE id = ?", item_id)
+            row = it.item(self.db, item_id)
+        if row["attempts"] > MAX_ATTEMPTS:
+            msg = f"gave up after {MAX_ATTEMPTS} attempts in {row['state']}"
+            if row["last_error"]:
+                msg += f"; last error: {row['last_error']}"
+            raise RunFailed(msg)
+
     # --- a Claude run ------------------------------------------------------------
 
     def _run(self, item_id: str, kind: str, inputs: dict) -> None:
+        self._attempt(item_id)
         cur = self.db.run("INSERT INTO runs (item_id, kind, input_json, status, started_at) "
                           "VALUES (?, ?, ?, 'queued', ?)", item_id, kind, json.dumps(inputs), now())
         run_id = cur.lastrowid
@@ -508,6 +525,7 @@ class Runner:
     # --- merge -------------------------------------------------------------------
 
     def _merge(self, item_id: str) -> None:
+        self._attempt(item_id)
         item = it.item(self.db, item_id)
         proj = it.project(self.db, item["project_id"])
         P = git_project(self.cfg, proj)
