@@ -1,0 +1,23 @@
+# Installed by scripts/deploy.sh (@PACE_USER@ / @APP_DIR@ / @UV@ filled in).
+[Unit]
+Description=PACE — Claude Code orchestrator
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+User=@PACE_USER@
+Group=@PACE_USER@
+WorkingDirectory=@APP_DIR@
+Environment=PACE_CONFIG=/etc/pace/config.toml
+ExecStart=@UV@ run --frozen --no-dev python -m pace
+# Binding the Tailscale IP fails until tailscaled is up; just retry.
+Restart=on-failure
+RestartSec=10
+# Stopping sends SIGTERM to the whole cgroup (claude included, which cleans up
+# its tool processes); runs in progress become `interrupted` and Retry resumes
+# them. No NoNewPrivileges or similar hardening: PACE needs sudo to reach the
+# agent user.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

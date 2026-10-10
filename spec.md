@@ -279,7 +279,13 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
   - Its global `~/.claude/CLAUDE.md` comes from `scripts/agent-CLAUDE.md`: headless, no human reading; install tools into its home (uv, `pip --user`), never sudo; don't switch branches or push; leave the worktree clean; verify precisely. Auto-memory stays on.
 - PACE never executes code from agent directories. On the agent side it only runs `git` and `claude` through sudo; on its side it works only in its own bare repos and bundle files.
 - All Claude-produced text is rendered escaped.
-- `scripts/setup-vm.sh` (idempotent, run with sudo) creates the agent user, the sudoers rule, the agent's CLAUDE.md and the data dir. Push credentials are per-repo deploy keys. For a GitHub project, PACE generates an ed25519 key in `keys/` when the project is saved. Every origin operation uses it through `core.sshCommand` in the canonical repo (`-c` for the first clone), so `~/.ssh/config` is never edited. The settings page shows the public key with a link to the repo's "add deploy key" page. **Check access** runs `ls-remote` and then a dry-run push, so it catches a key added without write access, and nothing is written. Until the check passes, the project page shows a setup banner.
+- `scripts/setup-vm.sh` (idempotent, run as root) sets up a VM:
+  - the system packages (including project build dependencies the agent can't install itself);
+  - the `pace` user with `uv`;
+  - the agent user with its own `claude`, Rust and `uv`;
+  - the sudoers rule, the agent's CLAUDE.md, the data dir and `/etc/pace/config.toml`.
+- `scripts/deploy.sh` resets `/opt/pace` to `origin/main` with the PACE project's own deploy key, runs `uv sync`, installs `pace.service`, and restarts once no runs are in progress.
+- `scripts/export-data.sh` and `import-data.sh` move the DB, keys and logs between VMs. See DEPLOY.md. Push credentials are per-repo deploy keys. For a GitHub project, PACE generates an ed25519 key in `keys/` when the project is saved. Every origin operation uses it through `core.sshCommand` in the canonical repo (`-c` for the first clone), so `~/.ssh/config` is never edited. The settings page shows the public key with a link to the repo's "add deploy key" page. **Check access** runs `ls-remote` and then a dry-run push, so it catches a key added without write access, and nothing is written. Until the check passes, the project page shows a setup banner.
 
 ---
 
