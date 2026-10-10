@@ -223,3 +223,22 @@ def test_import_flow(tmp_path, db, runner, scenario, project):
     prompt = calls(tmp_path)[-1]["argv"]
     text = prompt[prompt.index("-p") + 1]
     assert "Order is a suggestion." in text and "## Part of: Tier 2\n\nRealism." in text
+
+
+def test_moved_to_new_vm(tmp_path, db, runner, scenario, origin, item):
+    """Worktree and Claude session gone (as after a move): approve still works."""
+    import shutil
+    scenario("plan_ready", "noresume -", "implement_done")
+    go(runner, act.plan, item)
+    shutil.rmtree(runner.cfg.agent_home)            # the agent's clone and worktrees
+    shutil.rmtree(runner.cfg.data_dir / "repos")    # canonical repos re-clone themselves
+    go(runner, act.approve, item)
+    assert state(db, item) == "ready_to_test"
+    c = calls(tmp_path)
+    assert "--resume" in c[1]["argv"] and "--resume" not in c[2]["argv"]  # fresh session
+    fresh = c[2]["argv"][c[2]["argv"].index("-p") + 1]
+    assert "could not be resumed" in fresh and "Your latest plan" in fresh
+    assert "worktree_recreated" in [e["kind"] for e in it.events(db, item)]
+    shutil.rmtree(runner.cfg.data_dir / "repos")
+    go(runner, act.merge, item)
+    assert state(db, item) == "merged"

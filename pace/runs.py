@@ -76,6 +76,19 @@ def is_rate_limited(r: RunResult) -> bool:
     return not r.ok and any(s in text for s in ("rate limit", "usage limit", "rate_limit"))
 
 
+def resume_failed(r: RunResult) -> bool:
+    """The session couldn't be resumed (e.g. it was created on another VM).
+
+    claude still emits a result event for this: subtype error_during_execution,
+    zero turns, errors ["No conversation found with session ID: …"].
+    """
+    res = r.result_event
+    if res is None:
+        return True
+    return bool(res.get("is_error")) and (res.get("num_turns") == 0 or
+                                          "No conversation found" in str(res.get("errors")))
+
+
 def latest_impl_output(db: DB, item_id: str) -> dict | None:
     row = db.one("SELECT output_json FROM runs WHERE item_id = ? AND status = 'succeeded' AND "
                  f"kind IN ({', '.join('?' * len(IMPL_KINDS))}) ORDER BY id DESC LIMIT 1",
@@ -220,7 +233,10 @@ class Runner:
             session = None  # a plan run always starts a new conversation
             it.update(self.db, item_id, plan_base_commit=base, branch=g.branch_name(item_id),
                       session_id=None)
-        elif kind == "implement":
+        elif g.ensure_worktree(self.agent, P, item_id):
+            it.event(self.db, item_id, "worktree_recreated", "system",
+                     {"message": "the item worktree was missing and has been recreated"})
+        if kind == "implement":
             g.ensure_canonical(P)
             base = g.reset_to_base(self.agent, P, item_id)
             it.update(self.db, item_id, impl_base_commit=base)
@@ -281,7 +297,7 @@ class Runner:
                 if attempt == 2:
                     raise RunFailed("run failed twice: "
                                     f"{r.stderr.strip()[-500:] or 'no valid structured output'}")
-                if session and r.result_event is None:
+                if session and resume_failed(r):
                     why = "resume failed; starting a fresh session"
                     retry_prompt, session = self._fresh(item, prompt), None
                 else:
@@ -498,6 +514,7 @@ class Runner:
         out = latest_impl_output(self.db, item_id)
         if out is None:
             raise RunFailed("no successful implementation run to take the commit message from")
+        g.ensure_canonical(P)  # it may not exist yet (e.g. after moving to a new VM)
         m = g.merge_local(P, item_id, out["commit_message"], strategy=proj["merge_strategy"])
         if not m.merged:
             self._transition(item_id, "implementing", data={"conflicts": m.conflicts})

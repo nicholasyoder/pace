@@ -239,6 +239,26 @@ def add_worktree(agent: Agent, p: Project, item_id: str) -> str:
     return head(agent, wt)
 
 
+def ensure_worktree(agent: Agent, p: Project, item_id: str) -> bool:
+    """Recreate the item worktree if it's gone (new VM, manual cleanup); True if created.
+
+    It starts from the item branch if the canonical repo has one (pushed for
+    testing), else from the base.
+    """
+    wt = p.worktree(item_id)
+    if agent.git("rev-parse", "--git-dir", cwd=wt, check=False).returncode == 0:
+        return False
+    ensure_canonical(p)
+    ensure_agent_clone(agent, p)
+    b = branch_name(item_id)
+    has_branch = agent.git("rev-parse", "--verify", "--quiet", f"refs/remotes/canon/{b}",
+                           cwd=p.agent_repo, check=False).returncode == 0
+    agent.git("worktree", "prune", cwd=p.agent_repo)
+    agent.git("worktree", "add", "--quiet", "-B", b, wt,
+              f"canon/{b}" if has_branch else f"canon/{p.base}", cwd=p.agent_repo)
+    return True
+
+
 def reset_to_base(agent: Agent, p: Project, item_id: str) -> str:
     """Implement start: move the worktree's branch onto the latest base."""
     agent.git("fetch", "--quiet", "--prune", "canon", cwd=p.agent_repo)
