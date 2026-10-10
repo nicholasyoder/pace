@@ -52,7 +52,7 @@ def test_plan_answer_implement_merge(tmp_path, db, runner, scenario, origin, ite
     assert state(db, item) == "approved"
     go(runner, act.implement, item)
     row = it.item(db, item)
-    assert row["state"] == "ready_to_test" and row["reverify"] == 0
+    assert row["state"] == "ready_to_test" and row["reverify"] == 0 and row["attempts"] == 0
     assert sh("git", "branch", "--list", "pace/TOY-001", cwd=origin)  # pushed for testing
 
     go(runner, act.merge, item)
@@ -138,6 +138,28 @@ def test_blocked(db, runner, scenario, item):
     go(runner, act.plan, item)
     row = it.item(db, item)
     assert row["state"] == "failed" and "needs a design decision" in row["last_error"]
+
+
+def test_attempt_cap(db, runner, scenario, item):
+    blocked = 'plan_ready {"status": "blocked", "blocked_reason": "flaky"}'
+    scenario(blocked, blocked, blocked, "plan_ready")
+    go(runner, act.plan, item)
+    for _ in range(2):  # what an automatic re-queue does
+        it.transition(db, item, "planning", "system", expect="failed")
+        runner.start(item, "plan")
+        runner.wait()
+    assert it.item(db, item)["attempts"] == 3
+    it.transition(db, item, "planning", "system", expect="failed")
+    runner.start(item, "plan")
+    runner.wait()
+    row = it.item(db, item)
+    assert row["state"] == "failed"
+    assert "gave up after 3 attempts in planning; last error: " in row["last_error"]
+    assert "flaky" in row["last_error"]
+    assert len(runs(db, item)) == 3 and scenario.left() == ["plan_ready"]  # no 4th call
+    go(runner, act.retry, item)
+    row = it.item(db, item)
+    assert row["state"] == "plan_ready" and row["attempts"] == 0
 
 
 def test_done_without_commits_is_a_violation(db, runner, scenario, item):

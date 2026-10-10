@@ -238,7 +238,7 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 2. `approved` → start `implement`, in roadmap order, if dependencies are merged, an implementation slot is free and `ready_to_test` < `test_ahead`.
 3. While `planning` + `needs_input` + `plan_ready` < `plan_ahead`, plan the next `backlog` item in roadmap order whose dependencies are at least `approved`. Imports are never started by the scheduler; they start by hand.
 4. Respect the global concurrency cap.
-5. More than 3 attempts in one state → `failed`, with the reason.
+5. More than 3 attempts in one state → `failed`, with the reason. Every run or merge started for an item counts as an attempt in its current state (`items.attempts`). The count resets when the item moves on: any transition except into `failed`, or the system moving it out of `failed` (automatic re-queueing). A human Retry, back to backlog or park resets it. A 4th start is refused before Claude is called: the item goes to `failed` with "gave up after 3 attempts in <state>; last error: …".
 
 Each tick runs the steps across all unpaused projects in turn (feedback in every project, then implementation, then planning), so step 1 goes ahead of all other work. A wake-up is any change published on the bus.
 
