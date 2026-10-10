@@ -44,6 +44,22 @@ class RunResult:
         )
 
 
+def stop(proc: subprocess.Popen, grace: float = 15) -> None:
+    """End a run: SIGTERM first, SIGKILL after `grace` seconds.
+
+    sudo relays SIGTERM to claude, which kills its tool processes and exits
+    (verified in M1). SIGKILL would only kill sudo and orphan claude under the
+    agent user, where PACE can't signal it.
+    """
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 @dataclass
 class Agent:
     user: str | None
@@ -79,6 +95,7 @@ class Agent:
         model: str = "",
         log_path: Path | None = None,
         on_event: Callable[[dict], None] | None = None,
+        on_start: Callable[[subprocess.Popen], None] | None = None,
     ) -> RunResult:
         schema_json = (SCHEMA_DIR / f"{schema}.json").read_text()
         argv = [self.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
@@ -98,8 +115,9 @@ class Agent:
         err = tempfile.TemporaryFile(mode="w+")
         proc = subprocess.Popen(argv, cwd=run_cwd, stdout=subprocess.PIPE,
                                 stderr=err, text=True)
-        # sudo relays the signal to claude
-        killer = threading.Timer(self.timeout, proc.kill)
+        if on_start:
+            on_start(proc)
+        killer = threading.Timer(self.timeout, stop, (proc,))
         killer.start()
         try:
             assert proc.stdout is not None

@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """Stand-in for `claude -p` that replays recorded stream-json, so tests spend no quota.
 
-Picks a fixture from tests/fixtures/stream/ by run type:
-  implement schema            → implement_done (and commits a file in cwd)
+With $FAKE_CLAUDE_SCENARIO set, each invocation pops the first line of that file:
+
+    <fixture> [<json merged into structured_output>]
+    plan_ready {"status": "blocked", "blocked_reason": "nope"}
+    invalid plan_ready        # replay without structured_output (contract violation)
+    resolve implement_done    # merge canon/$FAKE_BASE (-s ours) before replaying
+    nocommit implement_done   # implement run that makes no commit
+
+Without it, the fixture is picked by run type:
+  implement schema            → implement_done
   plan schema with --resume   → plan_ready
   plan schema, fresh          → plan_needs_input
+
+Implement runs (unless `nocommit`) append a line to fake_change.txt and commit it.
+Every invocation's argv is appended to $FAKE_CLAUDE_CALLS, if set, as JSON.
 """
 
 import argparse
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "stream"
+IDENT = ["-c", "user.name=fake", "-c", "user.email=fake@localhost"]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-p", dest="prompt")
@@ -22,17 +36,49 @@ ap.add_argument("--permission-mode")
 ap.add_argument("--dangerously-skip-permissions", action="store_true")
 args, _ = ap.parse_known_args()
 
-if "commit_message" in (args.json_schema or ""):
-    if not args.dangerously_skip_permissions:
-        sys.exit("fake_claude: implement run without write permissions")
-    Path("fake_change.txt").write_text("implemented by fake_claude\n")
-    ident = ["-c", "user.name=fake", "-c", "user.email=fake@localhost"]
-    subprocess.run(["git", *ident, "add", "fake_change.txt"], check=True)
-    subprocess.run(["git", *ident, "commit", "-qm", "fake change"], check=True)
+if calls := os.environ.get("FAKE_CLAUDE_CALLS"):
+    with open(calls, "a") as f:
+        f.write(json.dumps({"cwd": os.getcwd(), "argv": sys.argv[1:]}) + "\n")
+
+implement = "commit_message" in (args.json_schema or "")
+flags: set[str] = set()
+overrides: dict = {}
+scenario = os.environ.get("FAKE_CLAUDE_SCENARIO")
+if scenario and Path(scenario).exists() and Path(scenario).read_text().strip():
+    lines = Path(scenario).read_text().strip().splitlines()
+    Path(scenario).write_text("\n".join(lines[1:]) + "\n")
+    words = lines[0].split(" ", 1)
+    while words[0] in ("invalid", "resolve", "nocommit"):
+        flags.add(words[0])
+        words = words[1].split(" ", 1)
+    fixture = words[0]
+    if len(words) > 1:
+        overrides = json.loads(words[1])
+elif implement:
     fixture = "implement_done"
 elif args.resume:
     fixture = "plan_ready"
 else:
     fixture = "plan_needs_input"
 
-sys.stdout.write((FIXTURES / f"{fixture}.jsonl").read_text())
+if implement:
+    if not args.dangerously_skip_permissions:
+        sys.exit("fake_claude: implement run without write permissions")
+    if "resolve" in flags:
+        base = os.environ.get("FAKE_BASE", "main")
+        subprocess.run(["git", *IDENT, "merge", "-q", "--no-edit", "-s", "ours", f"canon/{base}"],
+                       check=True)
+    if "nocommit" not in flags:
+        with open("fake_change.txt", "a") as f:
+            f.write("implemented by fake_claude\n")
+        subprocess.run(["git", *IDENT, "add", "fake_change.txt"], check=True)
+        subprocess.run(["git", *IDENT, "commit", "-qm", "fake change"], check=True)
+
+for line in (FIXTURES / f"{fixture}.jsonl").read_text().splitlines():
+    e = json.loads(line)
+    if e.get("type") == "result":
+        if "invalid" in flags:
+            e.pop("structured_output", None)
+        else:
+            e["structured_output"] = {**e["structured_output"], **overrides}
+    sys.stdout.write(json.dumps(e) + "\n")

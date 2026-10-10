@@ -3,7 +3,7 @@ You are planning roadmap item {{item_id}}: "{{title}}". You are running headless
 ## Item
 
 {{description}}
-
+{{dependencies}}
 ## Your task
 
 Investigate the code and write an implementation plan. Do not change any files.

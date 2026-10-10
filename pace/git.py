@@ -81,6 +81,22 @@ def delete_remote_branch(p: Project, item_id: str) -> None:
     git("push", "--quiet", "origin", "--delete", branch_name(item_id), cwd=p.canonical, check=False)
 
 
+def is_ancestor(p: Project, a: str, b: str) -> bool:
+    return subprocess.run(["git", "-C", str(p.canonical), "merge-base", "--is-ancestor", a, b],
+                          capture_output=True).returncode == 0
+
+
+def branch_diff(p: Project, item_id: str, stat: bool = False) -> str:
+    """What merging pace/<ID> would change: diff from the merge base with <base>."""
+    args = ["--stat"] if stat else []
+    return git("diff", *args, f"{p.base}...{branch_name(item_id)}", cwd=p.canonical, check=False)
+
+
+def branch_log(p: Project, item_id: str) -> str:
+    return git("log", "--format=%h %s", f"{p.base}..{branch_name(item_id)}", cwd=p.canonical,
+               check=False)
+
+
 @dataclass
 class MergeResult:
     merged: bool
@@ -128,18 +144,28 @@ def ensure_agent_clone(agent: Agent, p: Project) -> None:
 
 
 def add_worktree(agent: Agent, p: Project, item_id: str) -> str:
-    """Create the item worktree on a fresh branch from canon/<base>; return its base commit."""
+    """Put the item worktree on a fresh branch from canon/<base>; return its base commit.
+
+    If the worktree already exists (a retried or unparked item) it is reset
+    instead, keeping the path stable for session resume.
+    """
     ensure_agent_clone(agent, p)
     wt = p.worktree(item_id)
-    agent.git("worktree", "add", "--quiet", "-B", branch_name(item_id), wt,
-              f"canon/{p.base}", cwd=p.agent_repo)
+    if agent.git("rev-parse", "--git-dir", cwd=wt, check=False).returncode == 0:
+        reset_worktree(agent, wt)
+        agent.git("checkout", "--quiet", "-B", branch_name(item_id), f"canon/{p.base}", cwd=wt)
+    else:
+        agent.git("worktree", "prune", cwd=p.agent_repo)
+        agent.git("worktree", "add", "--quiet", "-B", branch_name(item_id), wt,
+                  f"canon/{p.base}", cwd=p.agent_repo)
     return head(agent, wt)
 
 
 def reset_to_base(agent: Agent, p: Project, item_id: str) -> str:
-    """Implement start: move the (clean) worktree's branch onto the latest base."""
+    """Implement start: move the worktree's branch onto the latest base."""
     agent.git("fetch", "--quiet", "--prune", "canon", cwd=p.agent_repo)
     wt = p.worktree(item_id)
+    reset_worktree(agent, wt)
     agent.git("checkout", "--quiet", "-B", branch_name(item_id), f"canon/{p.base}", cwd=wt)
     return head(agent, wt)
 

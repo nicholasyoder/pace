@@ -1,0 +1,180 @@
+"""Item flows through actions + runner against fake_claude, as the current user."""
+
+import gzip
+import json
+from pathlib import Path
+
+import pytest
+
+from pace import actions as act
+from pace import items as it
+from pace.runs import latest_impl_output
+from tests.conftest import push_to_origin, sh
+
+
+def state(db, item_id):
+    return it.item(db, item_id)["state"]
+
+
+def runs(db, item_id):
+    return [(r["kind"], r["status"]) for r in
+            db.all("SELECT * FROM runs WHERE item_id = ? ORDER BY id", item_id)]
+
+
+def calls(tmp_path):
+    return [json.loads(x) for x in (tmp_path / "calls.jsonl").read_text().splitlines()]
+
+
+def go(runner, fn, *args):
+    fn(runner, *args)
+    runner.wait()
+
+
+@pytest.fixture
+def item(db, project):
+    return it.add_item(db, project["id"], "Greet many", "Support greeting multiple people.")
+
+
+def test_plan_answer_implement_merge(tmp_path, db, runner, scenario, origin, item):
+    scenario("plan_needs_input", "plan_ready", "implement_done")
+    go(runner, act.plan, item)
+    assert state(db, item) == "needs_input"
+    rnd = db.one("SELECT * FROM qa_rounds WHERE item_id = ?", item)
+    assert [q["id"] for q in json.loads(rnd["questions_json"])] == ["q1_format"]
+
+    with pytest.raises(act.ActionError, match="no answer"):
+        act.answer(runner, item, {})
+    go(runner, act.answer, item, {"q1_format": "b — keep it simple"})
+    assert state(db, item) == "plan_ready"
+    assert db.one("SELECT COUNT(*) FROM plans WHERE item_id = ?", item)[0] == 2
+
+    go(runner, act.approve, item)  # starts implement straight away
+    row = it.item(db, item)
+    assert row["state"] == "ready_to_test" and row["reverify"] == 0
+    assert sh("git", "branch", "--list", "pace/TOY-001", cwd=origin)  # pushed for testing
+
+    go(runner, act.merge, item)
+    assert state(db, item) == "merged"
+    assert sh("git", "log", "--format=%s", "main", cwd=origin).splitlines() == \
+        ["TOY-002: greet multiple people", "init"]
+    assert sh("git", "branch", "--list", "pace/*", cwd=origin) == ""
+    assert not Path(runner.cfg.agent_home / "work/toy/wt" / item).exists()
+
+    assert runs(db, item) == [("plan", "succeeded"), ("answers", "succeeded"),
+                              ("implement", "succeeded")]
+    costs = [r["cost_usd"] for r in db.all("SELECT cost_usd FROM runs ORDER BY id")]
+    assert costs == pytest.approx([0.2374174, 0.0355976, 0.2862412])  # per-run deltas
+
+    c = calls(tmp_path)
+    assert "--resume" not in c[0]["argv"] and "--permission-mode" in c[0]["argv"]
+    assert c[1]["argv"][c[1]["argv"].index("--resume") + 1] == "0a607ce7-5920-466c-95a2-73a43f80ec7c"
+    assert "--dangerously-skip-permissions" in c[2]["argv"]
+    assert "keep it simple" in c[1]["argv"][c[1]["argv"].index("-p") + 1]
+
+    log = db.one("SELECT log_path FROM runs WHERE kind = 'plan'")["log_path"]
+    with gzip.open(log, "rt") as f:
+        assert json.loads(f.read().splitlines()[-1])["type"] == "result"
+    assert db.kv_get("rate_limit")["status"] == "allowed"
+    assert scenario.left() == []
+
+
+def test_problem_then_address_feedback(tmp_path, db, runner, scenario, origin, item):
+    scenario("plan_ready", "implement_done",
+             'implement_done {"summary": "fixed it", "manual_checks": ["look again"]}')
+    go(runner, act.plan, item)
+    go(runner, act.approve, item)
+    first = sh("git", "rev-parse", "pace/TOY-001", cwd=origin)
+    go(runner, act.problem, item, "it greets nobody")
+    assert state(db, item) == "ready_to_test"
+    assert sh("git", "rev-parse", "pace/TOY-001~1", cwd=origin) == first  # added on top
+    assert latest_impl_output(db, item)["manual_checks"] == ["look again"]
+    prompt = calls(tmp_path)[-1]["argv"]
+    assert "it greets nobody" in prompt[prompt.index("-p") + 1]
+
+
+def test_merge_conflict_resolved_by_claude(tmp_path, db, runner, scenario, origin, item):
+    scenario("plan_ready", "implement_done", "resolve implement_done")
+    go(runner, act.plan, item)
+    go(runner, act.approve, item)
+    push_to_origin(tmp_path, origin, "fake_change.txt", "someone else's version\n")
+
+    go(runner, act.merge, item)
+    row = it.item(db, item)
+    assert row["state"] == "ready_to_test" and row["reverify"] == 1
+    assert runs(db, item)[-1] == ("resolve_conflicts", "succeeded")
+    prompt = calls(tmp_path)[-1]["argv"]
+    assert "fake_change.txt" in prompt[prompt.index("-p") + 1]
+
+    go(runner, act.merge, item)
+    assert state(db, item) == "merged"
+
+
+def test_invalid_output_retries_once(tmp_path, db, runner, scenario, item):
+    scenario("invalid plan_ready", "plan_ready")
+    go(runner, act.plan, item)
+    assert state(db, item) == "plan_ready"
+    assert len(calls(tmp_path)) == 2
+    assert [e["kind"] for e in it.events(db, item)].count("run_retry") == 1
+
+
+def test_invalid_twice_fails_then_retry(tmp_path, db, runner, scenario, item):
+    scenario("invalid plan_ready", "invalid plan_ready", "plan_ready")
+    go(runner, act.plan, item)
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "failed twice" in row["last_error"]
+    assert runs(db, item) == [("plan", "failed")]
+    go(runner, act.retry, item)
+    assert state(db, item) == "plan_ready"
+
+
+def test_blocked(db, runner, scenario, item):
+    scenario('plan_ready {"status": "blocked", "blocked_reason": "needs a design decision"}')
+    go(runner, act.plan, item)
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "needs a design decision" in row["last_error"]
+
+
+def test_done_without_commits_is_a_violation(db, runner, scenario, item):
+    scenario("plan_ready", "nocommit implement_done", "implement_done")
+    go(runner, act.plan, item)
+    go(runner, act.approve, item)
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "no new commits" in row["last_error"]
+    go(runner, act.retry, item)
+    assert state(db, item) == "ready_to_test"
+
+
+def test_revise_plan_and_proposals(db, runner, scenario, project, item):
+    prop = {"title": "Add tests", "description": "d", "reason": "r"}
+    scenario(f'plan_ready {json.dumps({"proposed_items": [prop]})}',
+             f'plan_ready {json.dumps({"proposed_items": [prop], "plan_markdown": "v2"})}')
+    go(runner, act.plan, item)
+    go(runner, act.revise_plan, item, "smaller please")
+    assert state(db, item) == "plan_ready"
+    assert [r["version"] for r in db.all("SELECT version FROM plans")] == [1, 2]
+    assert db.one("SELECT COUNT(*) FROM proposals")[0] == 1  # deduped by title
+    act.park(runner, item)
+    act.unpark(runner, item)
+    assert state(db, item) == "backlog"
+
+
+def test_dependencies_gate_and_context(tmp_path, db, runner, scenario, project, item):
+    b = it.add_item(db, project["id"], "Follow-up", depends=[item])
+    with pytest.raises(act.ActionError, match="waiting on TOY-001"):
+        act.plan(runner, b)
+    scenario("plan_ready", "plan_ready")
+    go(runner, act.plan, item)
+    act.approve(runner, item)  # implement would start; keep it simple and wait
+    runner.wait()
+    go(runner, act.plan, b)
+    prompt = calls(tmp_path)[-1]["argv"]
+    assert "### TOY-001: Greet many" in prompt[prompt.index("-p") + 1]
+
+
+def test_recover_after_restart(db, runner, item):
+    it.transition(db, item, "planning", "human")
+    db.run("INSERT INTO runs (item_id, kind, status, pid) VALUES (?, 'plan', 'running', 999999)",
+           item)
+    runner.recover()
+    assert state(db, item) == "failed"
+    assert db.one("SELECT status FROM runs")["status"] == "interrupted"

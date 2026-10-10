@@ -62,6 +62,7 @@ CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
     item_id TEXT REFERENCES items(id),
     kind TEXT NOT NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',   -- what the prompt was built from; Retry reuses it
     status TEXT NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'interrupted', 'rate_limited')),
     pid INTEGER,
