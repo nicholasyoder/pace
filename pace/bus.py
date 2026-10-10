@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator
 from typing import Any
 
 
@@ -39,15 +38,15 @@ class Bus:
         except asyncio.QueueFull:
             pass
 
-    async def subscribe(self, *topics: str) -> AsyncIterator[dict[str, Any]]:
+    def open(self, *topics: str) -> asyncio.Queue:
+        """Subscribe; read with `await q.get()` (safe to cancel), then `close(q)`."""
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
         with self._lock:
             for t in topics:
                 self._subs.setdefault(t, set()).add(q)
-        try:
-            while True:
-                yield await q.get()
-        finally:
-            with self._lock:
-                for t in topics:
-                    self._subs.get(t, set()).discard(q)
+        return q
+
+    def close(self, q: asyncio.Queue) -> None:
+        with self._lock:
+            for subs in self._subs.values():
+                subs.discard(q)

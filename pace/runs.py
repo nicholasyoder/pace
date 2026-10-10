@@ -145,8 +145,10 @@ class Runner:
                           last_error="interrupted: PACE restarted while this was in progress")
 
     def publish(self, item_id: str, msg: dict | None = None) -> None:
-        self.bus.publish(f"item:{item_id}", msg or {"type": "state"})
-        self.bus.publish("global", {"type": "changed", "item": item_id})
+        msg = msg or {"type": "state"}
+        self.bus.publish(f"item:{item_id}", msg)
+        if msg["type"] != "stream":
+            self.bus.publish("global", {"type": "changed", "item": item_id})
 
     # --- threads ------------------------------------------------------------------
 

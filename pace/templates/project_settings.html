@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name if project else 'New project' }} · PACE{% endblock %}
+{% block content %}
+<h1>{% if project %}{{ project.name }} settings{% else %}New project{% endif %}</h1>
+<form method="post" class="stack settings">
+  {% if not project %}
+  <label>Slug <input type="text" name="slug" value="{{ values.slug or '' }}" pattern="[A-Z][A-Z0-9]*" required placeholder="WEB">
+    <small>Item ID prefix (WEB-001). Uppercase; can't be changed later.</small></label>
+  {% endif %}
+  <label>Name <input type="text" name="name" value="{{ values.name or '' }}" required></label>
+  <label>Origin <input type="text" name="origin" value="{{ values.origin or '' }}" required placeholder="git@github-web:owner/repo.git">
+    <small>Must be pushable by PACE: use a per-repo SSH alias with a write-enabled deploy key.</small></label>
+  <label>Base branch <input type="text" name="base_branch" value="{{ values.base_branch or 'main' }}" required></label>
+  <div class="grid2">
+    <label>Merge mode <select name="merge_mode">
+      {% for m in ['local', 'pr'] %}<option {% if (values.merge_mode or 'local') == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select><small>PR mode arrives in M3.</small></label>
+    <label>Merge strategy <select name="merge_strategy">
+      {% for m in ['squash', 'merge'] %}<option {% if (values.merge_strategy or 'squash') == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select></label>
+    <label>Plan ahead <input type="number" min="0" name="plan_ahead" value="{{ values.get('plan_ahead', 3) }}"></label>
+    <label>Test ahead <input type="number" min="0" name="test_ahead" value="{{ values.get('test_ahead', 2) }}"></label>
+    <label>Concurrent implementations <input type="number" min="1" name="max_concurrent_implementations" value="{{ values.get('max_concurrent_implementations', 1) }}"></label>
+    <label>Model <input type="text" name="model" value="{{ values.model or '' }}" placeholder="Claude Code default"></label>
+  </div>
+  <label>Extra instructions <textarea name="extra_instructions" rows="5" placeholder="Appended to every prompt for this project">{{ values.extra_instructions or '' }}</textarea></label>
+  {% if project %}<label class="check"><input type="checkbox" name="paused" value="1" {% if values.paused %}checked{% endif %}> Paused</label>{% endif %}
+  <div class="actions"><button class="primary">{% if project %}Save{% else %}Create project{% endif %}</button></div>
+</form>
+{% endblock %}

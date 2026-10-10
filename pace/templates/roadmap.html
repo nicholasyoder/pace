@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} roadmap · PACE{% endblock %}
+{% block content %}
+<div class="crumbs"><a href="/p/{{ project.slug }}">{{ project.name }}</a></div>
+<h1>Roadmap as markdown</h1>
+<p class="muted">Active items only. Order is priority. <code>## Title</code> without an ID adds an item; removing an item offers to park it.</p>
+{% if errors %}
+<div class="flash error">Nothing was saved:
+  <ul>{% for e in errors %}<li>{% if e.line %}line {{ e.line }}: {% endif %}{{ e.message }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+<form method="post" class="stack">
+  {% if missing %}
+  <div class="flash">This leaves out {{ missing|join(', ') }}.
+    <label class="check"><input type="checkbox" name="park_missing" value="1" required> Park {{ 'it' if missing|length == 1 else 'them' }}</label>
+  </div>
+  {% endif %}
+  <textarea name="text" rows="30" class="mono" spellcheck="false">{{ text }}</textarea>
+  <pre class="muted small">## {{ project.slug }}-014: Title
+- depends: {{ project.slug }}-003, {{ project.slug }}-009
+
+Free-form description until the next ## heading.</pre>
+  <div class="actions"><button class="primary">Save</button> <a href="/p/{{ project.slug }}">Cancel</a></div>
+</form>
+{% endblock %}

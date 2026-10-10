@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+{% block title %}{{ item.id }} · PACE{% endblock %}
+{% block live %}<div data-sse="/events/item/{{ item.id }}" hidden></div>{% endblock %}
+{% macro act(name, label, cls="") -%}
+<form method="post" action="/i/{{ item.id }}/{{ name }}" class="inline"><button class="{{ cls }}">{{ label }}</button></form>
+{%- endmacro %}
+{% block content %}
+<div class="crumbs"><a href="/p/{{ project.slug }}">{{ project.name }}</a></div>
+<div class="item-head">
+  <h1><span class="id">{{ item.id }}</span> {{ item.title }}</h1>
+  <div class="row wrap">
+    <span class="badge state-{{ item.state }}">{{ item.state|replace('_', ' ') }}</span>
+    <span class="muted" title="{{ item.state_since }}">for {{ item.state_since|age }}</span>
+    {% if item.reverify %}<span class="badge warn" title="Claude resolved merge conflicts after your last test">re-verify</span>{% endif %}
+    {% for d, row in deps %}
+      <a href="/i/{{ d }}" class="badge {% if d in unmet %}warn{% endif %}">depends on {{ d }}{% if row %} · {{ row.state }}{% endif %}</a>
+    {% endfor %}
+    {% if total_cost %}<span class="muted">· ${{ '%.2f' % total_cost }}</span>{% endif %}
+  </div>
+</div>
+
+{% if unmet %}<div class="flash">Waiting on {{ unmet|join(', ') }}.</div>{% endif %}
+{% if item.state == 'failed' %}<div class="flash error"><strong>Failed:</strong> <pre class="wrap">{{ item.last_error }}</pre></div>{% endif %}
+{% if item.summary and item.state not in ('backlog',) %}<p class="summary">{{ item.summary }}</p>{% endif %}
+
+{# ---------- primary actions by state ---------- #}
+<div class="actions">
+{% if item.state == 'backlog' %}
+  {{ act('plan', 'Plan now', 'primary') }} {{ act('park', 'Park') }}
+{% elif item.state in ('planning', 'implementing', 'merging') %}
+  <span class="spinner"></span> <span>{{ {'planning': 'Claude is planning', 'implementing': 'Claude is implementing', 'merging': 'Merging'}[item.state] }}…</span>
+  {% if busy and item.state != 'merging' %}{{ act('cancel', 'Stop run') }}{% endif %}
+{% elif item.state == 'approved' %}
+  <span>Approved; waiting for an implementation slot.</span> {{ act('implement', 'Implement now', 'primary') }} {{ act('park', 'Park') }}
+{% elif item.state == 'changes_requested' %}
+  <span>Problem reported; waiting for a slot.</span> {{ act('address_feedback', 'Start fix now', 'primary') }} {{ act('park', 'Park') }}
+{% elif item.state == 'failed' %}
+  {{ act('retry', 'Retry', 'primary') }} {{ act('backlog', 'Back to backlog') }} {{ act('park', 'Park') }}
+{% elif item.state == 'parked' %}
+  {{ act('unpark', 'Unpark') }}
+{% elif item.state == 'merged' %}
+  <span>Merged.</span>
+{% endif %}
+</div>
+
+{# ---------- questions ---------- #}
+{% if open_round %}
+<section class="panel">
+  <h2>Questions</h2>
+  <form method="post" action="/i/{{ item.id }}/answer">
+  {% for q in open_round.questions_json|fromjson %}
+    <fieldset class="question">
+      <legend>{{ q.text }}</legend>
+      <p class="muted">{{ q.why_it_matters }}</p>
+      {% for o in q.options %}
+      <label class="option {% if o.id == q.recommended %}recommended{% endif %}">
+        <input type="radio" name="q_{{ q.id }}" value="{{ o.id }}">
+        <span><strong>{{ o.label }}</strong>{% if o.id == q.recommended %} <span class="badge ok">recommended</span>{% endif %}<br>
+        <span class="muted">{{ o.description }}</span></span>
+      </label>
+      {% endfor %}
+      {% if q.allow_free_text %}<input type="text" name="t_{{ q.id }}" placeholder="Other / extra detail (optional)">{% endif %}
+    </fieldset>
+  {% endfor %}
+    <label class="check"><input type="checkbox" name="decide_rest" value="1"> Let Claude decide the rest (unanswered questions use the recommended option)</label>
+    <div class="actions"><button class="primary">Send answers</button></div>
+  </form>
+  <div class="actions">{{ act('park', 'Park') }}</div>
+</section>
+{% endif %}
+
+{# ---------- test & merge ---------- #}
+{% if impl and item.state in ('ready_to_test', 'changes_requested', 'merging', 'merged') %}
+<section class="panel">
+  <h2>Test &amp; merge</h2>
+  {% if impl.verified %}
+  <h3>Verified by Claude</h3>
+  <ul class="verified">{% for v in impl.verified %}<li>{{ v|mdi }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if impl.manual_checks %}
+  <h3>Manual checks</h3>
+  <ul class="checklist">{% for m in impl.manual_checks %}<li><label><input type="checkbox"> <span>{{ m|mdi }}</span></label></li>{% endfor %}</ul>
+  {% endif %}
+  {% if impl.notes %}<h3>Notes</h3><div class="md">{{ impl.notes|md }}</div>{% endif %}
+  {% if item.state in ('ready_to_test', 'changes_requested') %}
+  <h3>Branch</h3>
+  <pre class="cmd">git fetch origin &amp;&amp; git checkout {{ branch }}</pre>
+  {% if log %}<pre class="log">{{ log }}</pre>{% endif %}
+  {% if diff %}
+  <details><summary>Diff <span class="muted">{{ diffstat.splitlines()[-1] if diffstat else '' }}</span></summary>
+    <pre class="diff">{{ diff|diff }}</pre>
+  </details>
+  {% endif %}
+  <details><summary>Commit message</summary><pre class="wrap">{{ impl.commit_message }}</pre></details>
+  {% endif %}
+  {% if item.state == 'ready_to_test' %}
+  <div class="actions">
+    {{ act('merge', 'Works → merge', 'primary') }}
+  </div>
+  <form method="post" action="/i/{{ item.id }}/problem" class="stack">
+    <textarea name="note" rows="3" placeholder="What's wrong? Claude gets this verbatim."></textarea>
+    <div class="actions"><button>Problem…</button> {{ act('park', 'Park') }}</div>
+  </form>
+  {% endif %}
+</section>
+{% endif %}
+
+{# ---------- plan ---------- #}
+{% if plans %}
+<section class="panel">
+  <h2>Plan <span class="muted">v{{ plans[0].version }}</span></h2>
+  {% if item.state == 'needs_input' %}<p class="muted">Draft; Claude will revise it after your answers.</p>{% endif %}
+  {% if plan_diff and item.state == 'plan_ready' %}
+  <details><summary>Changes since v{{ plans[1].version }}</summary><pre class="diff">{{ plan_diff|diff }}</pre></details>
+  {% endif %}
+  {% set affected = plans[0].affected_files_json|fromjson %}
+  {% if affected %}<p class="muted">Affects: {% for f in affected %}<code>{{ f }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  <details {% if item.state in ('plan_ready', 'approved') %}open{% endif %}><summary>Plan text</summary>
+    <div class="md">{{ plans[0].markdown|md }}</div>
+  </details>
+  {% if item.state == 'plan_ready' %}
+  <div class="actions">{{ act('approve', 'Approve', 'primary') }} {{ act('park', 'Park') }}</div>
+  {% endif %}
+  {% if item.state in ('plan_ready', 'approved') %}
+  <form method="post" action="/i/{{ item.id }}/revise" class="stack">
+    <textarea name="feedback" rows="3" placeholder="Feedback on the plan; Claude revises it."></textarea>
+    <div class="actions"><button>Send feedback</button></div>
+  </form>
+  {% endif %}
+  {% if plans|length > 1 %}
+  <details><summary>Earlier versions</summary>
+    {% for p in plans[1:] %}<details><summary>v{{ p.version }} · {{ p.created_at|age }} ago</summary><div class="md">{{ p.markdown|md }}</div></details>{% endfor %}
+  </details>
+  {% endif %}
+</section>
+{% endif %}
+
+{# ---------- description ---------- #}
+<section class="panel">
+  <h2>Description</h2>
+  {% if item.description %}<div class="md">{{ item.description|md }}</div>{% else %}<p class="muted">No description.</p>{% endif %}
+  {% if item.state != 'merged' %}
+  <details><summary>Edit</summary>
+    <form method="post" action="/i/{{ item.id }}/edit" class="stack">
+      <label>Title <input type="text" name="title" value="{{ item.title }}" required></label>
+      <label>Depends on <input type="text" name="depends" value="{{ (item.depends_json|fromjson)|join(', ') }}" placeholder="{{ project.slug }}-003, …"></label>
+      <label>Description <textarea name="description" rows="10">{{ item.description }}</textarea></label>
+      <div class="actions"><button>Save</button></div>
+    </form>
+  </details>
+  {% endif %}
+</section>
+
+{# ---------- Q&A history ---------- #}
+{% set answered = rounds|selectattr('answers_json')|list %}
+{% if answered %}
+<section class="panel">
+  <h2>Questions &amp; answers</h2>
+  {% for r in answered %}
+    {% set a = r.answers_json|fromjson %}
+    <details><summary>Round {{ r.round }} · {{ r.answered_at|age }} ago</summary><pre class="wrap">{{ a.text }}</pre></details>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if proposals %}
+<section class="panel">
+  <h2>Proposed items</h2>
+  <ul>{% for p in proposals %}<li><strong>{{ p.title }}</strong> <span class="muted">({{ p.status }})</span>: {{ p.reason }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+{# ---------- activity ---------- #}
+<section class="panel">
+  <h2>Activity</h2>
+  {% if current %}
+  <h3>Live: {{ current.kind }} run <a href="/runs/{{ current.id }}" class="muted">#{{ current.id }}</a></h3>
+  <div id="live-lines" class="live">{% for l in live_lines %}<div>{{ l }}</div>{% endfor %}</div>
+  {% endif %}
+  {% if runs %}
+  <table class="runs">
+    <tr><th>Run</th><th>Kind</th><th>Status</th><th>Started</th><th>Cost</th></tr>
+    {% for r in runs %}
+    <tr><td><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td><td>{{ r.kind }}</td>
+      <td><span class="badge run-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ r.started_at|age }} ago</td><td>{% if r.cost_usd is not none %}${{ '%.2f' % r.cost_usd }}{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <details><summary>Events ({{ events|length }})</summary>
+    <ul class="events">
+    {% for e in events %}
+      {% set d = e.data_json|fromjson %}
+      <li><span class="muted">{{ e.ts|age }}</span> <span class="badge">{{ e.actor }}</span>
+        {% if e.kind == 'state' %}{{ d['from'] }} → <strong>{{ d['to'] }}</strong>{% else %}{{ e.kind }}{% endif %}
+        {% set extra = d.items()|rejectattr(0, 'in', ['from', 'to'])|list %}
+        {% if extra %}<pre class="wrap small">{% for k, v in extra %}{{ k }}: {{ v }}
+{% endfor %}</pre>{% endif %}
+      </li>
+    {% endfor %}
+    </ul>
+  </details>
+</section>
+{% endblock %}

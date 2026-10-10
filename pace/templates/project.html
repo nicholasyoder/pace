@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · PACE{% endblock %}
+{% block live %}<div data-sse="/events/global" hidden></div>{% endblock %}
+{% block content %}
+<div class="row wrap">
+  <h1>{{ project.name }} <span class="muted">{{ project.slug }}</span></h1>
+  <span class="spacer"></span>
+  <a class="button" href="/p/{{ project.slug }}/roadmap">Edit as markdown</a>
+  <a class="button" href="/p/{{ project.slug }}/settings">Settings</a>
+</div>
+<p class="muted">{{ project.origin }} · {{ project.base_branch }} · {{ project.merge_mode }} / {{ project.merge_strategy }}{% if project.paused %} · <strong>paused</strong>{% endif %}</p>
+
+<form method="post" action="/p/{{ project.slug }}/items" class="quick-add">
+  <input type="text" name="title" placeholder="Quick add: one line becomes an item" required>
+  <label class="check"><input type="checkbox" name="top" value="1"> top</label>
+  <button>Add</button>
+</form>
+
+<nav class="filter">
+  <a href="/p/{{ project.slug }}" {% if show == 'active' %}class="on"{% endif %}>Active</a>
+  <a href="/p/{{ project.slug }}?show=all" {% if show != 'active' %}class="on"{% endif %}>All (incl. merged &amp; parked)</a>
+</nav>
+
+<ol id="roadmap" class="roadmap">
+{% for r in rows %}
+  <li class="state-row-{{ r.state }}">
+    <div class="rm-main">
+      <a href="/i/{{ r.id }}"><span class="id">{{ r.id }}</span> {{ r.title }}</a>
+      <div class="row wrap small">
+        <span class="badge state-{{ r.state }}">{{ r.state|replace('_', ' ') }}</span>
+        {% if r.reverify %}<span class="badge warn">re-verify</span>{% endif %}
+        {% if unmet.get(r.id) %}<span class="muted">waiting on {{ unmet[r.id]|join(', ') }}</span>{% endif %}
+      </div>
+    </div>
+    <div class="rm-actions">
+      {% if r.state == 'backlog' and not unmet.get(r.id) %}
+        <form method="post" action="/i/{{ r.id }}/plan" class="inline"><input type="hidden" name="next" value="/p/{{ project.slug }}"><button class="small">Plan</button></form>
+      {% endif %}
+      {% if r.state not in ('merged', 'parked') %}
+      {% for where, label in [('top', '⤒'), ('up', '↑'), ('down', '↓')] %}
+        <button class="small" title="move {{ where }}" hx-post="/i/{{ r.id }}/move" hx-vals='{"where": "{{ where }}", "next": "/p/{{ project.slug }}"}' hx-target="#roadmap" hx-select="#roadmap" hx-swap="outerHTML">{{ label }}</button>
+      {% endfor %}
+      {% endif %}
+    </div>
+  </li>
+{% else %}
+  <li class="empty">No items. Quick-add one above, or edit as markdown.</li>
+{% endfor %}
+</ol>
+{% endblock %}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Inbox · PACE{% endblock %}
+{% block live %}<div data-sse="/events/global" hidden></div>{% endblock %}
+{% block content %}
+<div class="row">
+  <h1>Inbox</h1>
+  <span class="spacer"></span>
+  {% if all_projects|length > 1 %}
+  <nav class="filter">
+    <a href="/" {% if not project_filter %}class="on"{% endif %}>All</a>
+    {% for p in all_projects %}<a href="/?project={{ p.slug }}" {% if project_filter == p.slug %}class="on"{% endif %}>{{ p.slug }}</a>{% endfor %}
+  </nav>
+  {% endif %}
+</div>
+
+{% set ns = namespace(any=false) %}
+{% for label, rows in groups if rows %}
+  {% set ns.any = true %}
+  <section>
+    <h2>{{ label }} <span class="muted">{{ rows|length }}</span></h2>
+    {% for r in rows %}
+    <a class="card" href="/i/{{ r.id }}">
+      <div class="card-head">
+        <span class="id">{{ r.id }}</span>
+        <span class="title">{{ r.title }}</span>
+        <span class="spacer"></span>
+        {% if r.reverify %}<span class="badge warn">re-verify</span>{% endif %}
+        <span class="muted" title="{{ r.state_since }}">{{ r.state_since|age }}</span>
+      </div>
+      {% if r.state == 'failed' and r.last_error %}
+        <div class="card-body error-text">{{ r.last_error|truncate(240) }}</div>
+      {% elif r.summary %}
+        <div class="card-body">{{ r.summary }}</div>
+      {% endif %}
+    </a>
+    {% endfor %}
+  </section>
+{% endfor %}
+{% if not ns.any %}
+  <p class="empty">Nothing needs you right now.</p>
+{% endif %}
+
+{% if busy %}
+<section>
+  <h2>In progress</h2>
+  {% for r in busy %}
+  <a class="card quiet" href="/i/{{ r.id }}">
+    <div class="card-head">
+      <span class="id">{{ r.id }}</span><span class="title">{{ r.title }}</span>
+      <span class="spacer"></span>
+      <span class="badge state-{{ r.state }}">{{ r.state }}</span>
+      <span class="muted">{{ r.state_since|age }}</span>
+    </div>
+  </a>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if not all_projects %}
+<p class="empty">No projects yet. <a href="/projects/new">Add one</a>.</p>
+{% endif %}
+{% endblock %}

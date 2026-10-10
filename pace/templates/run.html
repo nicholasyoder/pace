@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} · PACE{% endblock %}
+{% block content %}
+<div class="crumbs">{% if run.item_id %}<a href="/i/{{ run.item_id }}">{{ run.item_id }}</a>{% endif %}</div>
+<h1>Run #{{ run.id }} <span class="muted">{{ run.kind }}</span></h1>
+<p><span class="badge run-{{ run.status }}">{{ run.status }}</span>
+  <span class="muted">started {{ run.started_at }}{% if run.ended_at %} · ended {{ run.ended_at }}{% endif %}
+  {% if run.cost_usd is not none %} · ${{ '%.2f' % run.cost_usd }}{% endif %}{% if run.session_id %} · session {{ run.session_id }}{% endif %}</span></p>
+{% if run.error %}<div class="flash error"><pre class="wrap">{{ run.error }}</pre></div>{% endif %}
+<div class="live tall">{% for l in lines %}<div>{{ l }}</div>{% else %}<div class="muted">No log.</div>{% endfor %}</div>
+{% if run.output_json %}
+<details><summary>Structured output</summary><pre class="wrap">{{ run.output_json|fromjson|tojson(indent=2) }}</pre></details>
+{% endif %}
+{% endblock %}
