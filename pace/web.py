@@ -246,6 +246,7 @@ async def project_save(request: Request, slug: str):
         return settings_page(request, p, 400, values=dict(form), error=str(e))
     if fields.get("origin") != p["origin"] or fields.get("base_branch") != p["base_branch"]:
         db_(request).run("DELETE FROM kv WHERE key = ?", f"access:{slug}")  # re-check
+    request.app.state.runner.publish("-")  # e.g. unpaused: wake the scheduler
     p = get_project(request, slug)
     if deploy_key(request, p) and not (db_(request).kv_get(f"access:{slug}") or {}).get("ok"):
         return back(f"/p/{slug}/settings#deploy-key")

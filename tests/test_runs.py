@@ -48,7 +48,9 @@ def test_plan_answer_implement_merge(tmp_path, db, runner, scenario, origin, ite
     assert state(db, item) == "plan_ready"
     assert db.one("SELECT COUNT(*) FROM plans WHERE item_id = ?", item)[0] == 2
 
-    go(runner, act.approve, item)  # starts implement straight away
+    act.approve(runner, item)  # only approves; the scheduler (or Implement) starts it
+    assert state(db, item) == "approved"
+    go(runner, act.implement, item)
     row = it.item(db, item)
     assert row["state"] == "ready_to_test" and row["reverify"] == 0
     assert sh("git", "branch", "--list", "pace/TOY-001", cwd=origin)  # pushed for testing
@@ -82,9 +84,12 @@ def test_problem_then_address_feedback(tmp_path, db, runner, scenario, origin, i
     scenario("plan_ready", "implement_done",
              'implement_done {"summary": "fixed it", "manual_checks": ["look again"]}')
     go(runner, act.plan, item)
-    go(runner, act.approve, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
     first = sh("git", "rev-parse", "pace/TOY-001", cwd=origin)
-    go(runner, act.problem, item, "it greets nobody")
+    act.problem(runner, item, "it greets nobody")
+    assert state(db, item) == "changes_requested"
+    go(runner, act.address_feedback, item)
     assert state(db, item) == "ready_to_test"
     assert sh("git", "rev-parse", "pace/TOY-001~1", cwd=origin) == first  # added on top
     assert latest_impl_output(db, item)["manual_checks"] == ["look again"]
@@ -95,7 +100,8 @@ def test_problem_then_address_feedback(tmp_path, db, runner, scenario, origin, i
 def test_merge_conflict_resolved_by_claude(tmp_path, db, runner, scenario, origin, item):
     scenario("plan_ready", "implement_done", "resolve implement_done")
     go(runner, act.plan, item)
-    go(runner, act.approve, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
     push_to_origin(tmp_path, origin, "fake_change.txt", "someone else's version\n")
 
     go(runner, act.merge, item)
@@ -137,7 +143,8 @@ def test_blocked(db, runner, scenario, item):
 def test_done_without_commits_is_a_violation(db, runner, scenario, item):
     scenario("plan_ready", "nocommit implement_done", "implement_done")
     go(runner, act.plan, item)
-    go(runner, act.approve, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
     row = it.item(db, item)
     assert row["state"] == "failed" and "no new commits" in row["last_error"]
     go(runner, act.retry, item)
@@ -164,8 +171,7 @@ def test_dependencies_gate_and_context(tmp_path, db, runner, scenario, project, 
         act.plan(runner, b)
     scenario("plan_ready", "plan_ready")
     go(runner, act.plan, item)
-    act.approve(runner, item)  # implement would start; keep it simple and wait
-    runner.wait()
+    act.approve(runner, item)
     go(runner, act.plan, b)
     prompt = calls(tmp_path)[-1]["argv"]
     assert "### TOY-001: Greet many" in prompt[prompt.index("-p") + 1]
@@ -232,7 +238,8 @@ def test_moved_to_new_vm(tmp_path, db, runner, scenario, origin, item):
     go(runner, act.plan, item)
     shutil.rmtree(runner.cfg.agent_home)            # the agent's clone and worktrees
     shutil.rmtree(runner.cfg.data_dir / "repos")    # canonical repos re-clone themselves
-    go(runner, act.approve, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
     assert state(db, item) == "ready_to_test"
     c = calls(tmp_path)
     assert "--resume" in c[1]["argv"] and "--resume" not in c[2]["argv"]  # fresh session

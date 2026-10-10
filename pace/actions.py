@@ -1,8 +1,11 @@
 """What I can do to an item (§7). The web layer and tests both go through here.
 
-Until the M2 scheduler exists, actions start the follow-up run directly when
-there's capacity; otherwise the item waits (e.g. `approved`) with a button to
-start it later.
+Most actions only transition the item; the web layer then publishes the change,
+which wakes the scheduler (pace/scheduler.py, §9) to start whatever comes next
+(Approve → `implement`, Problem → `address_feedback`). `plan`, `implement` and
+`address_feedback` are what the scheduler calls, and they double as the manual
+overrides (Plan now, Implement). `answer` and `revise_plan` still start their
+resumed run directly, so they need a free slot at the time.
 """
 
 from __future__ import annotations
@@ -33,13 +36,13 @@ def _impl_slot_free(r: Runner, item_id: str) -> bool:
     return n < proj["max_concurrent_implementations"] and r.can_start()
 
 
-def plan(r: Runner, item_id: str) -> None:
+def plan(r: Runner, item_id: str, *, actor: str = "human") -> None:
     item = it.item(r.db, item_id)
     unmet = it.unmet_dependencies(r.db, item, "approved")
     if unmet:
         raise ActionError(f"waiting on {', '.join(unmet)} (dependencies must be approved first)")
     _capacity(r)
-    it.transition(r.db, item_id, "planning", "human", expect="backlog")
+    it.transition(r.db, item_id, "planning", actor, expect="backlog")
     r.start(item_id, "import" if item["type"] == "import" else "plan")
 
 
@@ -83,10 +86,6 @@ def approve(r: Runner, item_id: str) -> None:
         _apply_import(r, item)
         return
     it.transition(r.db, item_id, "approved", "human", expect="plan_ready")
-    try:
-        implement(r, item_id)
-    except ActionError:
-        pass  # stays approved; the item page offers "Implement"
 
 
 def _apply_import(r: Runner, item) -> None:
@@ -106,7 +105,7 @@ def _apply_import(r: Runner, item) -> None:
     g.remove_worktree(r.agent, git_project(r.cfg, proj), item["id"])
 
 
-def implement(r: Runner, item_id: str) -> None:
+def implement(r: Runner, item_id: str, *, actor: str = "human") -> None:
     item = it.item(r.db, item_id)
     if item["type"] == "import":
         raise ActionError("an import has nothing to implement")
@@ -115,7 +114,7 @@ def implement(r: Runner, item_id: str) -> None:
         raise ActionError(f"waiting on {', '.join(unmet)} (dependencies must be merged first)")
     if not _impl_slot_free(r, item_id):
         raise ActionError("no implementation slot free for this project")
-    it.transition(r.db, item_id, "implementing", "human", expect="approved")
+    it.transition(r.db, item_id, "implementing", actor, expect="approved")
     r.start(item_id, "implement")
 
 
@@ -147,10 +146,6 @@ def problem(r: Runner, item_id: str, note: str) -> None:
         it.event(r.db, item_id, "feedback", "human", {"on": "implementation", "text": note})
         it.transition(r.db, item_id, "changes_requested", "human", expect="ready_to_test",
                       data={"note": note})
-    try:
-        address_feedback(r, item_id)
-    except ActionError:
-        pass  # waits in changes_requested
 
 
 def address_feedback(r: Runner, item_id: str) -> None:
