@@ -10,6 +10,7 @@
 </div>
 <p class="muted">{{ project.origin }} · {{ project.base_branch }} · {{ project.merge_mode }} / {{ project.merge_strategy }}{% if project.paused %} · <strong>paused</strong>{% endif %}</p>
 
+{% if needs_key %}<div class="flash">PACE can't reach the repo yet. <a href="/p/{{ project.slug }}/settings#deploy-key">Add the deploy key on GitHub</a> before planning anything.</div>{% endif %}
 <form method="post" action="/p/{{ project.slug }}/items" class="quick-add">
   <input type="text" name="title" placeholder="Quick add: one line becomes an item" required>
   <label class="check"><input type="checkbox" name="top" value="1"> top</label>

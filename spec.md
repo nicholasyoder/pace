@@ -58,6 +58,7 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
   pace.db
   logs/<run-id>.jsonl.gz       # 0700
   bundles/                     # branch transfer files
+  keys/<slug>_ed25519          # per-project GitHub deploy keys, 0700
   repos/<slug>.git             # bare canonical clone, 0755: agent-readable, pace-writable
 /home/pace-agent/work/<slug>/  # agent-owned, private (0700)
   repo.git                     # bare clone of the canonical repo, remote `canon`
@@ -77,14 +78,14 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 ## 5. Configuration
 
-**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (§9), per-run timeout. It holds no secrets: git push uses the `pace` user's SSH key and PRs use `pace`'s `gh auth`.
+**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (§9), per-run timeout. It holds no secrets: git push uses per-project deploy keys (or `pace`'s own SSH setup) and PRs use `pace`'s `gh auth`.
 
 **Project settings** (stored in the DB, edited with a UI form):
 
 | Field | Default | |
 |---|---|---|
 | `slug` | | Item ID prefix: `WEB-001` |
-| `name`, `origin`, `base_branch` | | `origin` must be pushable by `pace` (GitHub or a bare repo). For GitHub, use a per-repo SSH alias such as `git@github-<slug>:owner/repo.git` backed by a write-enabled deploy key |
+| `name`, `origin`, `base_branch` | | `origin` must be pushable by `pace`. A github.com origin (`owner/repo`, or its https/SSH URL, normalized to `git@github.com:owner/repo.git`) gets a PACE-generated deploy key (§11). Any other origin (an SSH alias, a local bare repo) uses `pace`'s own SSH setup |
 | `merge_mode` | `local` | `local` (PACE merges and pushes the base branch) or `pr` |
 | `merge_strategy` | `squash` | `squash` or `merge` |
 | `plan_ahead` | 3 | Max items in `planning` + `needs_input` + `plan_ready` |
@@ -257,7 +258,7 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
   - Its global `~/.claude/CLAUDE.md` comes from `scripts/agent-CLAUDE.md`: headless, no human reading; install tools into its home (uv, `pip --user`), never sudo; don't switch branches or push; leave the worktree clean; verify precisely. Auto-memory stays on.
 - PACE never executes code from agent directories. On the agent side it only runs `git` and `claude` through sudo; on its side it works only in its own bare repos and bundle files.
 - All Claude-produced text is rendered escaped.
-- `scripts/setup-vm.sh` (idempotent, run with sudo) creates the agent user, the sudoers rule, the agent's CLAUDE.md and the data dir. Push credentials for `pace` are per-repo deploy keys behind SSH host aliases.
+- `scripts/setup-vm.sh` (idempotent, run with sudo) creates the agent user, the sudoers rule, the agent's CLAUDE.md and the data dir. Push credentials are per-repo deploy keys. For a GitHub project, PACE generates an ed25519 key in `keys/` when the project is saved. Every origin operation uses it through `core.sshCommand` in the canonical repo (`-c` for the first clone), so `~/.ssh/config` is never edited. The settings page shows the public key with a link to the repo's "add deploy key" page. **Check access** runs `ls-remote` and then a dry-run push, so it catches a key added without write access, and nothing is written. Until the check passes, the project page shows a setup banner.
 
 ---
 

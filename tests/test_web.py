@@ -122,3 +122,37 @@ def test_pages_render(client, db, runner, scenario, project, item):
     for url in ("/", "/?project=TOY", "/p/TOY?show=all", "/projects/new", "/p/TOY/settings"):
         assert client.get(url).status_code == 200, url
     assert client.get("/i/NOPE-001").status_code == 404
+
+
+def test_github_project_gets_a_deploy_key(client, db, cfg, monkeypatch):
+    r = client.post("/projects/new", data={"slug": "GH", "name": "Gh", "base_branch": "main",
+                                           "origin": "https://github.com/someone/thing"},
+                    follow_redirects=False)
+    assert r.headers["location"] == "/p/GH/settings#deploy-key"
+    assert it.project(db, "GH")["origin"] == "git@github.com:someone/thing.git"
+    key = cfg.data_dir / "keys" / "gh_ed25519"
+    assert key.stat().st_mode & 0o777 == 0o600
+    page = client.get("/p/GH/settings").text
+    assert (key.with_suffix(".pub").read_text().split()[1]) in page
+    assert "github.com/someone/thing/settings/keys/new" in page
+    assert "reach the repo yet" in client.get("/p/GH").text
+
+    seen = {}
+
+    def fake_check(p):
+        seen["cmd"] = p.ssh_command
+        return True, "read and push access work"
+    monkeypatch.setattr("pace.git.check_access", fake_check)
+    post(client, "/p/GH/check-access")
+    assert str(key) in seen["cmd"]
+    assert "✓ read and push access work" in client.get("/p/GH/settings").text
+    assert "reach the repo yet" not in client.get("/p/GH").text
+
+
+def test_alias_and_local_origins_get_no_key(client, db, cfg, project):
+    for origin in ("git@github-nkms:a/b.git", project["origin"]):
+        client.post("/projects/new", data={"slug": "AL" if "github" in origin else "LO",
+                                           "name": "x", "base_branch": "main", "origin": origin})
+    assert not (cfg.data_dir / "keys").exists()
+    assert it.project(db, "AL")["origin"] == "git@github-nkms:a/b.git"
+    assert "Deploy key" not in client.get("/p/AL/settings").text

@@ -2,14 +2,35 @@
 {% block title %}{{ project.name if project else 'New project' }} · PACE{% endblock %}
 {% block content %}
 <h1>{% if project %}{{ project.name }} settings{% else %}New project{% endif %}</h1>
+{% if key %}
+<section class="panel" id="deploy-key">
+  <h2>Deploy key {% if key.access and key.access.ok %}<span class="badge ok">working</span>{% else %}<span class="badge warn">not set up</span>{% endif %}</h2>
+  {% if not (key.access and key.access.ok) %}
+  <ol>
+    <li>Open <a href="{{ key.add_url }}" target="_blank" rel="noopener">{{ key.owner }}/{{ key.repo }} → Settings → Deploy keys → Add</a>.</li>
+    <li>Title: <code>PACE {{ project.slug }}</code>. Paste the key below and tick <strong>Allow write access</strong>.</li>
+    <li>Come back and press <em>Check access</em>.</li>
+  </ol>
+  {% endif %}
+  <div class="copy-row">
+    <textarea id="pubkey" class="mono" rows="3" readonly>{{ key.public }}</textarea>
+    <button type="button" data-copy="#pubkey">Copy</button>
+  </div>
+  <form method="post" action="/p/{{ project.slug }}/check-access" class="actions">
+    <button {% if not (key.access and key.access.ok) %}class="primary"{% endif %}>Check access</button>
+    {% if key.access %}<span class="{{ 'ok-text' if key.access.ok else 'error-text' }}">{{ '✓' if key.access.ok else '✗' }} {{ key.access.message }}</span>
+      <span class="muted small">({{ key.access.at|age }} ago)</span>{% endif %}
+  </form>
+</section>
+{% endif %}
 <form method="post" class="stack settings">
   {% if not project %}
   <label>Slug <input type="text" name="slug" value="{{ values.slug or '' }}" pattern="[A-Z][A-Z0-9]*" required placeholder="WEB">
     <small>Item ID prefix (WEB-001). Uppercase; can't be changed later.</small></label>
   {% endif %}
   <label>Name <input type="text" name="name" value="{{ values.name or '' }}" required></label>
-  <label>Origin <input type="text" name="origin" value="{{ values.origin or '' }}" required placeholder="git@github-web:owner/repo.git">
-    <small>Must be pushable by PACE: use a per-repo SSH alias with a write-enabled deploy key.</small></label>
+  <label>Origin <input type="text" name="origin" value="{{ values.origin or '' }}" required placeholder="owner/repo">
+    <small>A GitHub repo (<code>owner/repo</code> or its URL) gets its own deploy key, shown here after saving. Anything else (an SSH alias, a local path) uses PACE's own SSH setup.</small></label>
   <label>Base branch <input type="text" name="base_branch" value="{{ values.base_branch or 'main' }}" required></label>
   <div class="grid2">
     <label>Merge mode <select name="merge_mode">

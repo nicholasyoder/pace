@@ -7,12 +7,15 @@ saves it to a file it owns and fetches from that.
 Layout:
   <data>/repos/<slug>.git                 canonical bare clone; refs/heads/* mirrors origin
   <data>/bundles/<ID>.bundle              transfer files
+  <data>/keys/<slug>_ed25519              per-project GitHub deploy key (optional)
   <agent_home>/work/<slug>/repo.git       agent bare clone, remote `canon`
   <agent_home>/work/<slug>/wt/<ID>        worktree on branch pace/<ID>
 """
 
 from __future__ import annotations
 
+import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +46,18 @@ class Project:
     base: str
     data_dir: Path
     agent_home: Path
+    ssh_key: Path | None = None  # deploy key for origin; None: the PACE user's own SSH setup
+
+    @property
+    def ssh_command(self) -> str | None:
+        if self.ssh_key is None:
+            return None
+        return (f"ssh -i {shlex.quote(str(self.ssh_key))} -o IdentitiesOnly=yes "
+                "-o StrictHostKeyChecking=accept-new")
+
+    def _ssh_args(self) -> list[str]:
+        """`git -c` args so origin operations use the deploy key (also before any clone)."""
+        return ["-c", f"core.sshCommand={self.ssh_command}"] if self.ssh_key else []
 
     @property
     def canonical(self) -> Path:
@@ -61,8 +76,14 @@ class Project:
 def ensure_canonical(p: Project) -> None:
     if not p.canonical.exists():
         p.canonical.parent.mkdir(parents=True, exist_ok=True)
-        git("clone", "--quiet", "--bare", p.origin, str(p.canonical))
+        git(*p._ssh_args(), "clone", "--quiet", "--bare", p.origin, str(p.canonical))
         git("config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*", cwd=p.canonical)
+    # settings may have changed since the clone
+    git("config", "remote.origin.url", p.origin, cwd=p.canonical)
+    if p.ssh_command:
+        git("config", "core.sshCommand", p.ssh_command, cwd=p.canonical)
+    else:
+        git("config", "--unset", "core.sshCommand", cwd=p.canonical, check=False)
     fetch_origin(p)
 
 
@@ -129,6 +150,63 @@ def merge_local(p: Project, item_id: str, message: str, strategy: str = "squash"
         if "non-fast-forward" not in push.stderr and "rejected" not in push.stderr:
             raise GitError(f"push: {push.stderr.strip()}")
     raise GitError(f"push of {p.base} kept being rejected")
+
+
+# --- GitHub deploy keys -------------------------------------------------------
+
+_GITHUB = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)?"
+                     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+
+
+def github_repo(origin: str) -> tuple[str, str] | None:
+    """(owner, repo) for a github.com origin, or `owner/repo` shorthand; else None.
+
+    SSH host aliases (git@github-foo:...) and local paths are not matched: those
+    use the PACE user's own SSH setup.
+    """
+    m = _GITHUB.match(origin.strip())
+    if not m or origin.strip().startswith(("/", ".", "~")):
+        return None
+    return m.group("owner"), m.group("repo")
+
+
+def normalize_origin(origin: str) -> str:
+    gh = github_repo(origin)
+    return f"git@github.com:{gh[0]}/{gh[1]}.git" if gh else origin.strip()
+
+
+def key_path(data_dir: Path, slug: str) -> Path:
+    return data_dir / "keys" / f"{slug.lower()}_ed25519"
+
+
+def ensure_deploy_key(path: Path, comment: str) -> str:
+    """Create an ed25519 key pair at `path` if missing; return the public key line."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment,
+                        "-f", str(path)], check=True, capture_output=True)
+    return Path(f"{path}.pub").read_text().strip()
+
+
+def check_access(p: Project) -> tuple[bool, str]:
+    """Can PACE read and push origin? Push is checked with a dry run (nothing is written)."""
+    ls = subprocess.run(["git", *p._ssh_args(), "ls-remote", "--heads", p.origin],
+                        capture_output=True, text=True, timeout=60)
+    if ls.returncode != 0:
+        return False, f"can't read the repo (is the deploy key added?): {ls.stderr.strip()}"
+    if f"refs/heads/{p.base}" not in ls.stdout:
+        return False, f"read access works, but there's no branch {p.base!r}"
+    try:
+        ensure_canonical(p)
+    except GitError as e:
+        return False, str(e)
+    push = subprocess.run(["git", "-C", str(p.canonical), "push", "--dry-run", "--quiet",
+                           "origin", f"{p.base}:refs/heads/pace-access-check"],
+                          capture_output=True, text=True, timeout=60)
+    if push.returncode != 0:
+        return False, ("read access works but push doesn't (tick “Allow write access” on "
+                       f"the deploy key): {push.stderr.strip()}")
+    return True, "read and push access work"
 
 
 # --- agent side (as the agent user) ----------------------------------------

@@ -24,6 +24,7 @@ from markupsafe import Markup, escape
 from pace import actions as act
 from pace import git as g
 from pace import items as it
+from pace.db import now
 from pace.roadmap import RoadmapError
 from pace.runs import activity_line, git_project, latest_impl_output, latest_plan
 
@@ -138,7 +139,27 @@ def project_form(form) -> dict[str, Any]:
     for k in ("name", "origin", "base_branch"):
         if k in fields and not fields[k]:
             raise ValueError(f"{k} is required")
+    if "origin" in fields:
+        fields["origin"] = g.normalize_origin(fields["origin"])
     return fields
+
+
+def deploy_key(request: Request, p) -> dict[str, Any] | None:
+    """Make sure a github.com project has its deploy key; return what the UI shows."""
+    gh = g.github_repo(p["origin"])
+    if gh is None:
+        return None
+    cfg = request.app.state.cfg
+    pub = g.ensure_deploy_key(g.key_path(cfg.data_dir, p["slug"]), f"pace-{p['slug'].lower()}")
+    return {"public": pub, "owner": gh[0], "repo": gh[1],
+            "add_url": f"https://github.com/{gh[0]}/{gh[1]}/settings/keys/new",
+            "access": db_(request).kv_get(f"access:{p['slug']}")}
+
+
+def settings_page(request: Request, p, status: int = 200, values=None, error=None):
+    return render(request, "project_settings.html", status, project=p,
+                  values=values if values is not None else dict(p), error=error,
+                  key=deploy_key(request, p))
 
 
 @router.get("/projects/new", response_class=HTMLResponse)
@@ -156,6 +177,8 @@ async def project_create(request: Request):
         msg = "that slug is taken" if isinstance(e, sqlite3.IntegrityError) else str(e)
         return render(request, "project_settings.html", 400, project=None, values=dict(form),
                       error=msg)
+    if deploy_key(request, p):
+        return back(f"/p/{p['slug']}/settings#deploy-key")
     return back(f"/p/{p['slug']}")
 
 
@@ -167,7 +190,9 @@ def project_page(request: Request, slug: str, show: str = "active"):
     unmet = {r["id"]: it.unmet_dependencies(db, r, "approved" if r["state"] == "backlog"
                                             else "merged")
              for r in rows if r["state"] in ("backlog", "approved")}
-    return render(request, "project.html", project=p, rows=rows, show=show, unmet=unmet)
+    key = deploy_key(request, p)
+    return render(request, "project.html", project=p, rows=rows, show=show, unmet=unmet,
+                  needs_key=bool(key and not (key["access"] or {}).get("ok")))
 
 
 @router.post("/p/{slug}/items")
@@ -186,8 +211,7 @@ async def quick_add(request: Request, slug: str):
 
 @router.get("/p/{slug}/settings", response_class=HTMLResponse)
 def project_settings(request: Request, slug: str):
-    p = get_project(request, slug)
-    return render(request, "project_settings.html", project=p, values=dict(p))
+    return settings_page(request, get_project(request, slug))
 
 
 @router.post("/p/{slug}/settings")
@@ -195,12 +219,28 @@ async def project_save(request: Request, slug: str):
     p = get_project(request, slug)
     form = await request.form()
     try:
-        it.update_project(db_(request), p["id"], **project_form(form),
-                          paused=int(bool(form.get("paused"))))
+        fields = project_form(form)
+        it.update_project(db_(request), p["id"], **fields, paused=int(bool(form.get("paused"))))
     except ValueError as e:
-        return render(request, "project_settings.html", 400, project=p, values=dict(form),
-                      error=str(e))
+        return settings_page(request, p, 400, values=dict(form), error=str(e))
+    if fields.get("origin") != p["origin"] or fields.get("base_branch") != p["base_branch"]:
+        db_(request).run("DELETE FROM kv WHERE key = ?", f"access:{slug}")  # re-check
+    p = get_project(request, slug)
+    if deploy_key(request, p) and not (db_(request).kv_get(f"access:{slug}") or {}).get("ok"):
+        return back(f"/p/{slug}/settings#deploy-key")
     return back(f"/p/{slug}")
+
+
+@router.post("/p/{slug}/check-access")
+async def project_check_access(request: Request, slug: str):
+    p = get_project(request, slug)
+    P = git_project(request.app.state.cfg, p)
+    try:
+        ok, message = await asyncio.to_thread(g.check_access, P)
+    except Exception as e:  # e.g. a hung ssh hitting the timeout
+        ok, message = False, f"{type(e).__name__}: {e}"
+    db_(request).kv_set(f"access:{slug}", {"ok": ok, "message": message, "at": now()})
+    return back(f"/p/{slug}/settings#deploy-key")
 
 
 @router.get("/p/{slug}/roadmap", response_class=HTMLResponse)

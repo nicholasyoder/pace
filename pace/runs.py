@@ -43,8 +43,10 @@ class Busy(RuntimeError):
 
 
 def git_project(cfg: Config, p: sqlite3.Row) -> g.Project:
+    key = g.key_path(cfg.data_dir, p["slug"])
+    use_key = key.exists() and g.github_repo(p["origin"]) is not None
     return g.Project(p["slug"].lower(), p["origin"], p["base_branch"], cfg.data_dir,
-                     cfg.agent_home)
+                     cfg.agent_home, ssh_key=key if use_key else None)
 
 
 def activity_line(e: dict) -> str | None:

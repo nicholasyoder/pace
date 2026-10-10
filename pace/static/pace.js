@@ -1,3 +1,19 @@
+// Copy buttons: <button data-copy="#selector">. navigator.clipboard needs a
+// secure context, which plain http over Tailscale isn't, so fall back to
+// selecting the text and execCommand.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-copy]");
+  if (!btn) return;
+  const el = document.querySelector(btn.dataset.copy);
+  const done = () => { const t = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = t), 1500); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(el.value).then(done);
+  } else {
+    el.select();
+    if (document.execCommand("copy")) done();
+  }
+});
+
 // Live updates over SSE. An element with data-sse names the stream:
 // - "stream" messages append to #live-lines (the current run's activity);
 // - anything else means the page is out of date: reload, unless I've started

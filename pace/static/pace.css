@@ -65,6 +65,9 @@ label.check input { width: auto; }
 .flash.error { border-color: var(--bad); }
 .flash pre { margin: .3em 0 0; background: transparent; padding: 0; }
 .error-text { color: var(--bad); }
+.ok-text { color: var(--ok); }
+.copy-row { display: flex; gap: 8px; align-items: flex-start; }
+.copy-row textarea { word-break: break-all; }
 
 /* badges */
 .badge { display: inline-block; font-size: .75rem; padding: 1px 8px; border-radius: 10px;

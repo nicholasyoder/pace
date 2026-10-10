@@ -62,3 +62,15 @@ def test_all_errors_reported():
     with pytest.raises(RoadmapError) as ei:
         parse("junk\n## WEB-001: a\n## WEB-001: b\n## WEB-9: c", "WEB")
     assert [e.line for e in ei.value.errors] == [1, 3, 4]
+
+
+@pytest.mark.parametrize("origin,want", [
+    ("owner/repo", "git@github.com:owner/repo.git"),
+    ("https://github.com/owner/repo.git/", "git@github.com:owner/repo.git"),
+    ("ssh://git@github.com/owner/repo", "git@github.com:owner/repo.git"),
+    ("git@github-nkms:owner/repo.git", "git@github-nkms:owner/repo.git"),
+    ("/srv/git/repo.git", "/srv/git/repo.git"),
+])
+def test_normalize_origin(origin, want):
+    from pace.git import normalize_origin
+    assert normalize_origin(origin) == want
