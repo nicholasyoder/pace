@@ -1,0 +1,311 @@
+# PACE — Spec (v0.2)
+
+**PACE** (Plan · Approve · Code · Evaluate). A personal, self-hosted orchestrator that turns per-project roadmaps into a steady pipeline of plans and implementations driven by Claude Code, and only interrupts me when a decision or a manual check is needed.
+
+Built for one user and one setup (a Linux VM reached over Tailscale). It is not a general-purpose tool. When in doubt, pick the simpler option.
+
+---
+
+## 1. Goals and principles
+
+**The workflow PACE replaces.** Open Claude Code → "plan how to proceed with item X" → answer Claude's questions → approve the plan → Claude implements → get test steps → test → merge. PACE automates every step that isn't a human decision or a human check.
+
+**Principles**
+
+1. **Deterministic core.** State transitions, scheduling, git and process management are plain code. The only LLM is Claude Code. It reports through structured output and code decides what happens next.
+2. **Claude Code does all the thinking.** Planning, implementing, self-testing, summaries, commit messages and manual test steps. PACE spawns the real `claude` binary headlessly and never touches its auth or calls Anthropic APIs.
+3. **Verification belongs to Claude, then to me.** PACE runs no test commands. Claude tests as far as it can while implementing and reports what it verified. Anything that needs a human (launch the app, look at the UI) comes back as manual check steps.
+4. **Inbox, not firehose.** The default view is "things that need me", oldest first.
+5. **Structural isolation** (§11). Claude runs with permission prompts off, so it can't be trusted with anything PACE holds.
+6. **Minimal.** No feature goes in unless I need it.
+
+**Non-goals:** multi-user, other coding agents, configurability for other setups, CI-style automated checks, a mobile app (the web UI must still work well on a phone).
+
+---
+
+## 2. Architecture
+
+```
+ Browser ──HTTP/SSE──► PACE server (one Python process, runs as user `pace`)
+                         ├─ Web UI (server-rendered + HTMX)
+                         ├─ Scheduler loop (asyncio)
+                         ├─ Run manager ── sudo -u pace-agent ──► claude -p (per item, in an agent-owned worktree)
+                         ├─ Git (bare canonical clone per project; fetch / merge / push / gh)
+                         └─ SQLite
+```
+
+One process, one SQLite DB, background work as asyncio tasks.
+
+---
+
+## 3. Stack
+
+- **Python 3.12, `uv`, FastAPI + Uvicorn.**
+- **Jinja2 + HTMX** (vendored) and one hand-written CSS file (light/dark from the system setting, responsive). No JS build step. Live updates over **SSE**.
+- **SQLite (WAL)** through stdlib `sqlite3` with plain SQL. Migrations are numbered `.sql` files applied at startup.
+- `markdown-it-py` renders markdown. Diffs come from `git diff` with simple +/- colouring.
+- The `gh` CLI handles PRs (authenticated as `pace`). Requires git ≥ 2.38 for `merge-tree --write-tree`.
+- `pytest`, plus a `fake_claude` script that emits canned stream-json, so tests spend no quota.
+
+```
+pace/
+  main.py config.py db.py
+  scheduler.py runs.py git.py roadmap.py notify.py
+  prompts/ templates/ static/ migrations/ tests/ scripts/setup-vm.sh
+data/                          # runtime, gitignored
+  pace.db
+  logs/<run-id>.jsonl.gz
+  repos/<slug>.git             # bare canonical clone (readable by the agent, writable only by pace)
+/home/pace-agent/work/<slug>/  # agent-owned clone + worktrees
+```
+
+---
+
+## 4. Concepts
+
+- **Project**: a codebase, its roadmap and its settings.
+- **Item**: one roadmap entry, with a stable ID like `WEB-014` that is never reused.
+- **Run**: one `claude` invocation for an item. Kinds: `plan`, `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, and `import` (not tied to an item).
+- **Inbox entry**: derived from item state when I need to act (§7).
+
+---
+
+## 5. Configuration
+
+**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (§9), per-run timeout. It holds no secrets: git push uses the `pace` user's SSH key and PRs use `pace`'s `gh auth`.
+
+**Project settings** (stored in the DB, edited with a UI form):
+
+| Field | Default | |
+|---|---|---|
+| `slug` | | Item ID prefix: `WEB-001` |
+| `name`, `origin`, `base_branch` | | `origin` must be pushable by `pace` (GitHub or a bare repo) |
+| `merge_mode` | `local` | `local` (PACE merges and pushes the base branch) or `pr` |
+| `merge_strategy` | `squash` | `squash` or `merge` |
+| `plan_ahead` | 3 | Max items in `planning` + `needs_input` + `plan_ready` |
+| `test_ahead` | 2 | Max items in `ready_to_test` before more implementations start |
+| `max_concurrent_implementations` | 1 | |
+| `model` | "" | Empty means the Claude Code default |
+| `extra_instructions` | "" | Appended to every prompt for this project |
+
+---
+
+## 6. Roadmap
+
+**The DB is canonical.** The markdown format below is used for import, the "edit as markdown" view and export.
+
+```markdown
+## WEB-014: Add CSV export for reports
+- depends: WEB-003, WEB-009
+
+Free-form markdown description: context, constraints, acceptance criteria.
+Everything until the next `## ` heading belongs to the item.
+```
+
+- **Order is priority.** Reorder to reprioritise; "move to top" bumps an item.
+- **Strict parser, no LLM.** A heading without an ID becomes a new item and gets the next ID (each project keeps a `next_id` counter). If a save leaves out an existing ID, the UI asks whether to park that item. Parse errors are shown with line numbers and nothing is saved until the markdown is valid.
+- **Editing:** a structured list (add, edit, reorder, park) plus a raw markdown view of the active items.
+- **Quick add:** one line becomes an item with that title. If it's underspecified, the planning run will ask.
+- **Import:** paste an existing roadmap or TODO. An `import` run (read-only Claude) converts it to this format. The UI shows the original and the result side by side; I edit and approve. Nothing is saved until I approve.
+- **Proposed items:** any run can propose new items or splits (§8.2). They appear in the inbox, where I accept them (they're added to the roadmap) or dismiss them.
+
+---
+
+## 7. Item lifecycle
+
+| State | Meaning | What moves it on |
+|---|---|---|
+| `backlog` | Not started | Scheduler |
+| `planning` | A `plan` / `revise_plan` run is in progress | Run completion |
+| `needs_input` | Claude has questions | **Me**: answer → `planning` |
+| `plan_ready` | Plan awaiting approval | **Me**: approve → `approved`; feedback → `planning`; park → `parked` |
+| `approved` | Waiting for an implementation slot | Scheduler |
+| `implementing` | An `implement` / `address_feedback` / `resolve_conflicts` run is in progress | Run completion |
+| `ready_to_test` | Branch pushed (and PR open in PR mode) | **Me**: "Works → merge" → `merging`; "Problem…" + note → `changes_requested` |
+| `changes_requested` | I reported a problem | Scheduler (goes ahead of other work) |
+| `merging` | Merge in progress | Deterministic; conflicts → `resolve_conflicts` run |
+| `merged` | Done; hidden from the active roadmap | — |
+| `failed` | Retries exhausted, contract violated, or Claude reported itself blocked | **Me**: retry, edit, or park |
+| `parked` | Set aside | **Me**: unpark → `backlog` |
+
+**Dependencies:** an item can be planned once all its dependencies are at least `approved`; their plans go to Claude as context. It can be implemented only once they are all `merged`. Unmet dependencies are not a state: the scheduler skips the item and its page shows "waiting on WEB-003".
+
+**Inbox** = `needs_input`, `plan_ready`, `ready_to_test`, `failed`, plus proposed items. Each card shows age and Claude's summary.
+
+**Stale plans:** when an item merges, any `plan_ready` or `approved` item whose plan lists `affected_files` that the merge changed is flagged "plan may be stale", with the overlapping files listed. I can trigger a `revise_plan` run from there. Nothing is discarded automatically.
+
+---
+
+## 8. Claude runs
+
+### 8.1 Invocation
+
+The run is spawned as the agent user with a scrubbed environment. cwd is the item's worktree. Verify the exact flags in M0.
+
+```
+sudo -n -u pace-agent env -i PATH=… HOME=/home/pace-agent \
+  claude -p "<prompt>" --output-format stream-json --verbose \
+    --json-schema <schema for this run kind> \
+    [--resume <session_id>] [--model …] \
+    [--permission-mode plan          # plan / revise_plan / import: read-only]
+    [--dangerously-skip-permissions] # implement / address_feedback / resolve_conflicts
+    --disallowedTools AskUserQuestion
+```
+
+- **Results come from structured output only.** Claude never writes artifact files, and PACE stores everything from the final `result` event (structured output, session_id, usage).
+- **Read-only check:** after every read-only run, the worktree must be clean. If it isn't, reset it, log an event and flag it in the UI.
+- **Stream events** are written to a gzipped log and sent over SSE to the item's live activity pane.
+- **Sessions:** the first run stores its `session_id`, and every later run on the item resumes that session in the same worktree path. If resume fails, start a fresh session and put the plan, the Q&A history and the feedback into the prompt.
+- **Invalid or missing structured output** gets one automatic retry that says what was wrong. After that the item goes to `failed`.
+- **Rate limits / quota:** detect from the exit code and message. The run is marked `rate_limited`, the item returns to its prior state, the scheduler backs off globally with an exponential delay, and the UI shows a banner.
+- Every run has a hard timeout.
+
+### 8.2 Output contracts (JSON schemas)
+
+**Plan runs** (`plan`, `revise_plan`):
+```json
+{ "status": "needs_input | plan_ready | blocked",
+  "summary": "1–2 sentences for the inbox card",
+  "plan_markdown": "Sections: Summary, Approach, Affected areas, Steps, Risks, Verification plan, Decisions",
+  "affected_files": ["src/…"],
+  "questions": [{ "id": "q1", "text": "…", "why_it_matters": "…",
+                  "options": [{"id": "a", "label": "…", "description": "…"}],
+                  "recommended": "a", "allow_free_text": true }],
+  "blocked_reason": null,
+  "proposed_items": [{ "title": "…", "description": "…", "reason": "…" }] }
+```
+
+**Implementation runs** (`implement`, `address_feedback`, `resolve_conflicts`):
+```json
+{ "status": "done | blocked",
+  "summary": "…",
+  "commit_message": "used for the squash merge and the PR title/body",
+  "verified": ["what Claude ran or checked, and the result"],
+  "manual_checks": ["steps only a human can do: launch X, look at Y, expect Z"],
+  "notes": "…", "blocked_reason": null,
+  "proposed_items": [] }
+```
+
+**Import run:** `{ "roadmap_markdown": "…" }`, which is then validated by the strict parser.
+
+Each plan version is stored, so plan review can show the changes since the previous version.
+
+### 8.3 Prompts
+
+Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, `import`. Every prompt includes the item, the plans of its dependencies, a reminder of the contract, and the project's `extra_instructions`. Key instructions:
+
+- **plan:** only ask questions that would change the implementation and can't be answered from the code; give a recommended option for each. Propose items when something should be split off or is out of scope.
+- **implement:** follow the approved plan (written against commit X; adapt if the code has moved on). Commit in logical commits on the item branch. Test as far as you can: build, run the tests, exercise the app headlessly if feasible. Report exactly what you verified, and list everything that still needs human eyes as `manual_checks`.
+
+---
+
+## 9. Scheduler
+
+A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** (e.g. `run_windows = ["22:00-08:00"]`; empty means always) and outside rate-limit backoff. Runs already in progress always finish.
+
+1. `changes_requested` → start `address_feedback`.
+2. `approved` → start `implement`, in roadmap order, if dependencies are merged, an implementation slot is free and `ready_to_test` < `test_ahead`.
+3. While `planning` + `needs_input` + `plan_ready` < `plan_ahead`, plan the next `backlog` item in roadmap order whose dependencies are at least `approved`.
+4. Respect the global concurrency cap.
+5. More than 3 attempts in one state → `failed`, with the reason.
+
+**On startup:** any run still marked `running` becomes `interrupted`, its PID is killed if still alive, and the item is re-queued to resume its session.
+
+**Controls:** pause project, pause all, plan now, move to top, park, retry.
+
+---
+
+## 10. Git
+
+**Repos**
+- **Canonical:** `data/repos/<slug>.git`, a bare clone owned by `pace` with remote `origin`. **PACE never runs git inside a directory the agent can write to**, apart from fetching from it.
+- **Agent:** `~pace-agent/work/<slug>/`, a clone of the canonical repo, with worktrees at `wt/<ID>` on branch `pace/<ID>`.
+
+**Flow**
+1. **Plan start:** `pace` fetches origin into the canonical repo. Then, as the agent: fetch the canonical repo and `worktree add wt/<ID> -b pace/<ID> canon/<base>`. Record `plan_base_commit`.
+2. **Implement start:** fetch again; as the agent, run `git checkout -B pace/<ID> canon/<base>` in the worktree (it's clean after planning, and the path stays the same so the session can resume). Record `impl_base_commit`.
+3. **After implementation:** `pace` fetches `pace/<ID>` from the agent clone into the canonical repo and pushes it to origin in both modes, so I can test from any machine. In PR mode, it also runs `gh pr create --draft` with a body built from the summary and manual checks. → `ready_to_test`.
+4. **Works → merge:** fetch origin, then `git merge-tree --write-tree origin/<base> pace/<ID>`:
+   - **Conflicts:** start a `resolve_conflicts` run (the agent merges the new base into its branch), then return to `ready_to_test` flagged "re-verify".
+   - **Clean, local mode:** `commit-tree` (squash: parent = base, message = `commit_message`; merge: two parents), then push to `origin/<base>`. If the push is rejected as non-fast-forward, start again from the fetch.
+   - **Clean, PR mode:** `gh pr ready`, then `gh pr merge --squash|--merge`.
+5. **After merge:** delete the remote branch, remove the worktree (as the agent), mark the item `merged`, and run the stale-plan check.
+6. **PR mode:** poll open PRs every few minutes. If a PR is merged or closed outside PACE, the item moves to `merged` or `parked`.
+
+---
+
+## 11. Security
+
+- The UI binds to the configured address (default `127.0.0.1`; in practice the Tailscale IP). There is no app auth.
+- Claude runs as **`pace-agent`**:
+  - It has no SSH keys, no `gh` auth, and no read access to `data/` except `data/repos/` (read-only).
+  - Its only git remote is the canonical bare repo.
+  - `pace` has a sudoers rule that allows only `claude` and `git` as `pace-agent`.
+- PACE never executes code from agent directories. Its git operations are limited to fetching from the agent clone and working in its own bare repos.
+- All Claude-produced text is rendered escaped.
+- The agent's `~/.claude` (global CLAUDE.md, settings, auto-memory) is set up deliberately rather than left empty or copied from mine. Decide in M0.
+- `scripts/setup-vm.sh` creates the users, the sudoers rule and the directories.
+
+---
+
+## 12. Data model (SQLite)
+
+- `projects(id, slug, name, origin, base_branch, merge_mode, merge_strategy, plan_ahead, test_ahead, max_concurrent_implementations, model, extra_instructions, next_id, paused)`
+- `items(id TEXT PK, project_id, position, title, description, depends_json, state, state_since, attempts, session_id, branch, plan_base_commit, impl_base_commit, pr_url, stale_json, summary, last_error, created_at, updated_at)`
+- `plans(item_id, version, markdown, affected_files_json, created_at)`
+- `qa_rounds(item_id, round, questions_json, answers_json, answered_at)`
+- `runs(id, item_id, kind, status[queued|running|succeeded|failed|interrupted|rate_limited], pid, session_id, started_at, ended_at, exit_code, usage_json, output_json, log_path, error)`
+- `proposals(id, project_id, source_item_id, title, description, reason, status)`
+- `events(id, item_id, ts, kind, actor[system|human|claude], data_json)`: an append-only audit log that includes feedback text and approvals.
+
+Every state transition is a single transaction that also writes an `events` row.
+
+---
+
+## 13. UI
+
+1. **Inbox** (default; all projects, with a project filter). Groups: *Questions*, *Plans to approve*, *Ready to test*, *Problems*, *Proposed items*. The count shows in the nav and the page title.
+2. **Item page**:
+   - Header with state and the primary action.
+   - **Questions:** radio options with the recommended one highlighted (not pre-selected), "why it matters", a free-text field, and "let Claude decide the rest".
+   - **Plan:** rendered plan, diff against the previous version, and Approve / Feedback / Park.
+   - **Test & merge:** summary, what Claude verified, the manual checks as a checklist, the diff, the branch/PR with a checkout command, and Works → merge / Problem….
+   - **Activity:** events and runs, with the live stream for the current run.
+3. **Project page:** the roadmap as an ordered list with state badges, plus reorder, quick add, edit, park, edit as markdown, import, the settings form and pause.
+4. **System:** current runs, backoff and run-window status, recent errors, usage per run.
+
+**Notifications:** an ntfy push when the inbox gains entries, at most one every N minutes, with a deep link.
+
+---
+
+## 14. Milestones (each must be usable)
+
+- **M0 — Spike (CLI, no UI).** For one item on a real repo, a script that:
+  - creates an agent worktree through sudo;
+  - runs a planning pass with structured output, takes answers in the terminal and resumes the session;
+  - takes approval, then implements with skip-permissions;
+  - prints the verified list and the manual checks;
+  - fetches the branch into the canonical repo and merges with `merge-tree`.
+  
+  Record the exact working flags and answer the questions in §15. Also build `fake_claude`.
+- **M1 — Core, end to end in local mode.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge.
+- **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps.
+- **M3 — The rest.** PR mode, ntfy, import, proposed items, stale-plan flag.
+- **M4 — Phone pass.** Layout polish for phone use.
+
+**Acceptance:** with two projects (one `local`, one `pr`), I import a roadmap and leave PACE running. Later I find plans and questions in the inbox, answer and approve them, and later still find branches ready to test with clear manual checks. I can merge both ways from the UI and never need a terminal.
+
+---
+
+## 15. Verify in M0 (don't assume)
+
+1. `claude` CLI behaviour:
+   - `-p` with stream-json;
+   - `--json-schema`, and where structured output appears in the result;
+   - `--resume` across different permission modes, and whether it requires the same cwd;
+   - headless `--permission-mode plan`;
+   - disallowing `AskUserQuestion`;
+   - what a rate-limit or quota error looks like.
+2. Headless auth for `pace-agent` (`claude setup-token` or similar) within Anthropic's terms.
+3. Fetching from the agent-owned repo as `pace`: how `safe.directory` interacts with it, and confirm that no repo config or hooks execute.
+4. `gh pr ready` / `gh pr merge` behaviour on draft PRs.
