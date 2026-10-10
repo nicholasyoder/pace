@@ -27,10 +27,15 @@ Probed with `claude` 2.1.296 on 2026-10-10, as `dev`, on a toy repo.
   → **Proactive backoff is possible:** the scheduler can stop starting runs above a utilization
   threshold and wait until `resetsAt`, instead of only reacting to failures. The rejected shape is still unseen
   (presumably `status != "allowed"`).
-- **Plan → skip-permissions resume:** NOT YET TESTED. Running `--dangerously-skip-permissions` as
-  `dev` is (rightly) blocked; this has to happen as `pace-agent` (Step 2).
+- **Plan → skip-permissions resume works** (as pace-agent, `sudo -D <wt>`): same session_id,
+  init shows `permissionMode: bypassPermissions`, Claude committed in logical commits, cleaned up
+  `__pycache__`, and reported honest `verified` / `manual_checks` / `proposed_items`.
+- Claude's `commit_message` already carries a `Co-Authored-By` trailer (agent's default attribution).
+- The agent's toolchain matters: pytest wasn't installed for pace-agent, so Claude fell back to
+  calling the test functions directly and flagged it. Per-project toolchains (uv, cargo, …) need
+  installing for pace-agent.
 
-Fixtures: `tests/fixtures/stream/plan_needs_input.jsonl`, `plan_ready_resumed.jsonl`.
+Fixtures (real pace-agent runs): `tests/fixtures/stream/{plan_needs_input,plan_ready,implement_done}.jsonl`.
 Schemas: `pace/schemas/{plan,implement}.json`.
 
 ## Users, sudo, cwd (setup-vm.sh)
@@ -57,6 +62,8 @@ Schemas: `pace/schemas/{plan,implement}.json`.
 - Local-mode merge: `merge-tree --write-tree origin/<base> pace/<ID>` → `commit-tree -p <base>`
   → push to origin. Tested ✓ against a local bare origin. (Commit identity needs setting for PACE.)
 
+**Full loop proven on the toy repo:** plan → question → answer → plan_ready → implement →
+bundle → canonical → push branch → merge-tree/commit-tree squash → push base → delete branch.
+
 ## Open
-- Plan → implement resume across permission modes (as pace-agent) — needs the `CWD=*` rule.
 - Agent `~/.claude` contents; per-project auto-memory dir is created under `~/.claude/projects/<slug>/memory`.
