@@ -10,6 +10,7 @@
 #   - the agent user (`pace-agent`) — Claude runs as this user with permission
 #     prompts off, so it gets no keys, no gh auth and no access to PACE's data
 #   - a sudoers rule letting PACE_USER run only `claude` and `git` as the agent
+#   - the agent's global ~/.claude/CLAUDE.md (from scripts/agent-CLAUDE.md)
 #   - the data dir: repos/ is agent-readable, everything else is PACE-only
 #
 # Afterwards, as a human (interactive, once):
@@ -36,6 +37,11 @@ fi
 passwd --lock "$AGENT_USER" >/dev/null
 chmod 0700 "$AGENT_HOME"
 install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$AGENT_HOME/work"
+
+# Agent's global CLAUDE.md (§11): set deliberately, not copied from a human's.
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$AGENT_HOME/.claude"
+install -o "$AGENT_USER" -g "$AGENT_USER" -m 0644 \
+    "$(dirname "$(readlink -f "$0")")/agent-CLAUDE.md" "$AGENT_HOME/.claude/CLAUDE.md"
 
 # Data dir, owned by PACE_USER. Only repos/ is traversable by others, so the
 # agent can clone the canonical bare repos but can't read the DB or logs.
