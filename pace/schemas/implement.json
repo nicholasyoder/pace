@@ -1,0 +1,12 @@
+{"type":"object","additionalProperties":false,
+ "required":["status","summary","commit_message","verified","manual_checks","notes","blocked_reason","proposed_items"],
+ "properties":{
+  "status":{"type":"string","enum":["done","blocked"]},
+  "summary":{"type":"string"},
+  "commit_message":{"type":"string"},
+  "verified":{"type":"array","items":{"type":"string"}},
+  "manual_checks":{"type":"array","items":{"type":"string"}},
+  "notes":{"type":"string"},
+  "blocked_reason":{"type":["string","null"]},
+  "proposed_items":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","description","reason"],
+     "properties":{"title":{"type":"string"},"description":{"type":"string"},"reason":{"type":"string"}}}}}}
