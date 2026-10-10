@@ -1,3 +1,5 @@
+import pytest
+
 from pace.config import load
 from pace.db import DB
 
@@ -28,3 +30,13 @@ def test_config(tmp_path):
     p.write_text('data_dir = "/tmp/x"\nport = 9000\n')
     c = load(p)
     assert c.port == 9000 and str(c.db_path) == "/tmp/x/pace.db"
+
+
+def test_config_run_windows(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('run_windows = ["22:00-08:00", "12:00-13:00"]\n')
+    assert load(p).run_windows == ["22:00-08:00", "12:00-13:00"]
+    for bad in ('run_windows = ["22:00-8"]', 'run_windows = "22:00-08:00"'):
+        p.write_text(bad + "\n")
+        with pytest.raises(ValueError, match="run_windows"):
+            load(p)

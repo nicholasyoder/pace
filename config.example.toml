@@ -7,3 +7,4 @@ agent_home = "/home/pace-agent"
 claude = "/home/pace-agent/.local/bin/claude"
 run_timeout_minutes = 60
 concurrency = 2             # global cap on simultaneous runs
+# run_windows = ["22:00-08:00"]  # server local time; spans midnight; absent/empty = always
