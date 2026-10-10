@@ -65,5 +65,11 @@ Schemas: `pace/schemas/{plan,implement}.json`.
 **Full loop proven on the toy repo:** plan → question → answer → plan_ready → implement →
 bundle → canonical → push branch → merge-tree/commit-tree squash → push base → delete branch.
 
+**Spike code proven for real** (`pace.spike`, as pace-agent via sudo, TOY-003 on the toy repo):
+plan → approve → implement → bundle → push branch → squash-merge, outcome `merged`.
+
 ## Open
+- Real feature run: nkms #24. Needs push credentials for the PACE-side user (none on this VM yet).
+- pace-agent toolchain: no pytest/uv; Claude works around it and flags it in `manual_checks`.
+- §15.4 (`gh pr ready/merge` on drafts) → deferred to M3 with PR mode.
 - Agent `~/.claude` contents; per-project auto-memory dir is created under `~/.claude/projects/<slug>/memory`.
