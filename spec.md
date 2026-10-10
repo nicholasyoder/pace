@@ -1,4 +1,4 @@
-# PACE — Spec (v0.2)
+# PACE — Spec (v0.3)
 
 **PACE** (Plan · Approve · Code · Evaluate). A personal, self-hosted orchestrator that turns per-project roadmaps into a steady pipeline of plans and implementations driven by Claude Code, and only interrupts me when a decision or a manual check is needed.
 
@@ -29,8 +29,8 @@ Built for one user and one setup (a Linux VM reached over Tailscale). It is not 
  Browser ──HTTP/SSE──► PACE server (one Python process, runs as user `pace`)
                          ├─ Web UI (server-rendered + HTMX)
                          ├─ Scheduler loop (asyncio)
-                         ├─ Run manager ── sudo -u pace-agent ──► claude -p (per item, in an agent-owned worktree)
-                         ├─ Git (bare canonical clone per project; fetch / merge / push / gh)
+                         ├─ Run manager ── sudo -u pace-agent -D <wt> ──► claude -p (per item, in an agent-owned worktree)
+                         ├─ Git (bare canonical clone per project; bundle-in / merge / push / gh)
                          └─ SQLite
 ```
 
@@ -40,7 +40,7 @@ One process, one SQLite DB, background work as asyncio tasks.
 
 ## 3. Stack
 
-- **Python 3.12, `uv`, FastAPI + Uvicorn.**
+- **Python ≥ 3.12 (the VM has 3.13), `uv`, FastAPI + Uvicorn.**
 - **Jinja2 + HTMX** (vendored) and one hand-written CSS file (light/dark from the system setting, responsive). No JS build step. Live updates over **SSE**.
 - **SQLite (WAL)** through stdlib `sqlite3` with plain SQL. Migrations are numbered `.sql` files applied at startup.
 - `markdown-it-py` renders markdown. Diffs come from `git diff` with simple +/- colouring.
@@ -50,13 +50,18 @@ One process, one SQLite DB, background work as asyncio tasks.
 ```
 pace/
   main.py config.py db.py
-  scheduler.py runs.py git.py roadmap.py notify.py
-  prompts/ templates/ static/ migrations/ tests/ scripts/setup-vm.sh
-data/                          # runtime, gitignored
+  scheduler.py runs.py agent.py git.py roadmap.py notify.py
+  prompts/ schemas/ templates/ static/ migrations/
+tests/ (fake_claude, fixtures/stream/)
+scripts/setup-vm.sh scripts/agent-CLAUDE.md
+/var/lib/pace/                 # data dir (config), owned by pace, 0711
   pace.db
-  logs/<run-id>.jsonl.gz
-  repos/<slug>.git             # bare canonical clone (readable by the agent, writable only by pace)
-/home/pace-agent/work/<slug>/  # agent-owned clone + worktrees
+  logs/<run-id>.jsonl.gz       # 0700
+  bundles/                     # branch transfer files
+  repos/<slug>.git             # bare canonical clone, 0755: agent-readable, pace-writable
+/home/pace-agent/work/<slug>/  # agent-owned, private (0700)
+  repo.git                     # bare clone of the canonical repo, remote `canon`
+  wt/<ID>                      # worktree on branch pace/<ID>
 ```
 
 ---
@@ -79,7 +84,7 @@ data/                          # runtime, gitignored
 | Field | Default | |
 |---|---|---|
 | `slug` | | Item ID prefix: `WEB-001` |
-| `name`, `origin`, `base_branch` | | `origin` must be pushable by `pace` (GitHub or a bare repo) |
+| `name`, `origin`, `base_branch` | | `origin` must be pushable by `pace` (GitHub or a bare repo). For GitHub, use a per-repo SSH alias such as `git@github-<slug>:owner/repo.git` backed by a write-enabled deploy key |
 | `merge_mode` | `local` | `local` (PACE merges and pushes the base branch) or `pr` |
 | `merge_strategy` | `squash` | `squash` or `merge` |
 | `plan_ahead` | 3 | Max items in `planning` + `needs_input` + `plan_ready` |
@@ -140,24 +145,26 @@ Everything until the next `## ` heading belongs to the item.
 
 ### 8.1 Invocation
 
-The run is spawned as the agent user with a scrubbed environment. cwd is the item's worktree. Verify the exact flags in M0.
+The run is spawned as the agent user (flags verified in M0 with `claude` 2.1.296). sudo's default `env_reset` and `secure_path` scrub the environment. PACE spawns sudo with cwd `/`, because the agent can't stat PACE's directories, and sets Claude's cwd with `-D`. PACE itself can't enter the agent's private worktree, and `claude` has no `--cwd` flag.
 
 ```
-sudo -n -u pace-agent env -i PATH=… HOME=/home/pace-agent \
-  claude -p "<prompt>" --output-format stream-json --verbose \
-    --json-schema <schema for this run kind> \
+sudo -n -u pace-agent -H -D <worktree> ~pace-agent/.local/bin/claude \
+    -p "<prompt>" --output-format stream-json --verbose \
+    --json-schema '<schema JSON for this run kind>' \
+    --disallowedTools AskUserQuestion \
     [--resume <session_id>] [--model …] \
-    [--permission-mode plan          # plan / revise_plan / import: read-only]
-    [--dangerously-skip-permissions] # implement / address_feedback / resolve_conflicts
-    --disallowedTools AskUserQuestion
+    [--permission-mode plan]          # plan / revise_plan / import: read-only
+    [--dangerously-skip-permissions]  # implement / address_feedback / resolve_conflicts
 ```
 
-- **Results come from structured output only.** Claude never writes artifact files, and PACE stores everything from the final `result` event (structured output, session_id, usage).
+- **Results come from structured output only.** Claude reports by calling a `StructuredOutput` tool. PACE reads `structured_output` (and `session_id`, `usage`, `subtype`, `is_error`) from the final `result` event. `total_cost_usd` is cumulative per session across resumes, so store per-run deltas.
+- In plan mode Claude doesn't call `ExitPlanMode`, but it may write a plan file to `~/.claude/plans/` in the agent's home. That's harmless.
+- **Resume** works across permission modes (plan → bypass) and even from a different cwd. PACE still keeps the worktree path stable.
 - **Read-only check:** after every read-only run, the worktree must be clean. If it isn't, reset it, log an event and flag it in the UI.
 - **Stream events** are written to a gzipped log and sent over SSE to the item's live activity pane.
 - **Sessions:** the first run stores its `session_id`, and every later run on the item resumes that session in the same worktree path. If resume fails, start a fresh session and put the plan, the Q&A history and the feedback into the prompt.
 - **Invalid or missing structured output** gets one automatic retry that says what was wrong. After that the item goes to `failed`.
-- **Rate limits / quota:** detect from the exit code and message. The run is marked `rate_limited`, the item returns to its prior state, the scheduler backs off globally with an exponential delay, and the UI shows a banner.
+- **Rate limits / quota:** every run emits `rate_limit_event`s whose `rate_limit_info` has `status` (`allowed` normally), `resetsAt`, and `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`. PACE stores the latest one. The scheduler stops starting runs while utilization is above a configured threshold, or while `status` isn't `allowed`, until `resetsAt`, and the UI shows a banner. A run that fails on a limit anyway is marked `rate_limited` and the item returns to its prior state. The exact failure shape is still unseen, so detect it loosely.
 - Every run has a hard timeout.
 
 ### 8.2 Output contracts (JSON schemas)
@@ -192,7 +199,7 @@ Each plan version is stored, so plan review can show the changes since the previ
 
 ### 8.3 Prompts
 
-Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, `import`. Every prompt includes the item, the plans of its dependencies, a reminder of the contract, and the project's `extra_instructions`. Key instructions:
+Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `answers`, `revise_plan`, `implement`, `address_feedback`, `resolve_conflicts`, `import`. `answers` and `revise_plan` are short follow-ups sent into the resumed session. Every prompt includes the item, the plans of its dependencies, a reminder of the contract, and the project's `extra_instructions`. Key instructions:
 
 - **plan:** only ask questions that would change the implementation and can't be answered from the code; give a recommended option for each. Propose items when something should be split off or is out of scope.
 - **implement:** follow the approved plan (written against commit X; adapt if the code has moved on). Commit in logical commits on the item branch. Test as far as you can: build, run the tests, exercise the app headlessly if feasible. Report exactly what you verified, and list everything that still needs human eyes as `manual_checks`.
@@ -201,7 +208,7 @@ Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `revise_plan`, `i
 
 ## 9. Scheduler
 
-A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** (e.g. `run_windows = ["22:00-08:00"]`; empty means always) and outside rate-limit backoff. Runs already in progress always finish.
+A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** (e.g. `run_windows = ["22:00-08:00"]`; empty means always) and outside rate-limit backoff (§8.1). Runs already in progress always finish.
 
 1. `changes_requested` → start `address_feedback`.
 2. `approved` → start `implement`, in roadmap order, if dependencies are merged, an implementation slot is free and `ready_to_test` < `test_ahead`.
@@ -218,13 +225,14 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 ## 10. Git
 
 **Repos**
-- **Canonical:** `data/repos/<slug>.git`, a bare clone owned by `pace` with remote `origin`. **PACE never runs git inside a directory the agent can write to**, apart from fetching from it.
-- **Agent:** `~pace-agent/work/<slug>/`, a clone of the canonical repo, with worktrees at `wt/<ID>` on branch `pace/<ID>`.
+- **Canonical:** `repos/<slug>.git`, a bare clone owned by `pace` whose `refs/heads/*` mirror origin (fetch refspec `+refs/heads/*:refs/heads/*`, `--prune`). **PACE never runs git in a repo the agent can write to**, and it can't read the agent's repos at all.
+- **Agent:** `~pace-agent/work/<slug>/repo.git`, a bare clone of the canonical repo (remote `canon`, refspec `+refs/heads/*:refs/remotes/canon/*`), with worktrees at `wt/<ID>` on branch `pace/<ID>`. The agent trusts the canonical repos through `safe.directory=/var/lib/pace/repos/*` in its global git config.
+- **Agent → PACE transfer is a bundle**, never a fetch. A fetch would run `upload-pack` against agent-written config. Instead, as the agent: `git bundle create - pace/<ID> ^canon/<base>` to stdout. PACE writes it to `bundles/`, runs `bundle verify`, then `fetch <file> +refs/heads/pace/<ID>:refs/heads/pace/<ID>`.
 
 **Flow**
-1. **Plan start:** `pace` fetches origin into the canonical repo. Then, as the agent: fetch the canonical repo and `worktree add wt/<ID> -b pace/<ID> canon/<base>`. Record `plan_base_commit`.
-2. **Implement start:** fetch again; as the agent, run `git checkout -B pace/<ID> canon/<base>` in the worktree (it's clean after planning, and the path stays the same so the session can resume). Record `impl_base_commit`.
-3. **After implementation:** `pace` fetches `pace/<ID>` from the agent clone into the canonical repo and pushes it to origin in both modes, so I can test from any machine. In PR mode, it also runs `gh pr create --draft` with a body built from the summary and manual checks. → `ready_to_test`.
+1. **Plan start:** `pace` fetches origin into the canonical repo. Then, as the agent: fetch `canon` and `worktree add -B pace/<ID> wt/<ID> canon/<base>`. Record `plan_base_commit`.
+2. **Implement start:** fetch again; as the agent, run `git checkout -B pace/<ID> canon/<base>` in the worktree (it's clean after planning, and the path stays the same). Record `impl_base_commit`. A `done` result with no new commits is a contract violation.
+3. **After implementation:** bundle `pace/<ID>` into the canonical repo (above) and push it to origin in both modes, so I can test from any machine. In PR mode, it also runs `gh pr create --draft` with a body built from the summary and manual checks. → `ready_to_test`.
 4. **Works → merge:** fetch origin, then `git merge-tree --write-tree origin/<base> pace/<ID>`:
    - **Conflicts:** start a `resolve_conflicts` run (the agent merges the new base into its branch), then return to `ready_to_test` flagged "re-verify".
    - **Clean, local mode:** `commit-tree` (squash: parent = base, message = `commit_message`; merge: two parents), then push to `origin/<base>`. If the push is rejected as non-fast-forward, start again from the fetch.
@@ -237,14 +245,15 @@ A loop runs every ~10 s and on every state change. It only starts runs inside a 
 ## 11. Security
 
 - The UI binds to the configured address (default `127.0.0.1`; in practice the Tailscale IP). There is no app auth.
-- Claude runs as **`pace-agent`**:
-  - It has no SSH keys, no `gh` auth, and no read access to `data/` except `data/repos/` (read-only).
+- Claude runs as **`pace-agent`** (password locked, home 0700):
+  - It has no SSH keys, no `gh` auth, and no read access to the data dir except `repos/` (read-only).
   - Its only git remote is the canonical bare repo.
-  - `pace` has a sudoers rule that allows only `claude` and `git` as `pace-agent`.
-- PACE never executes code from agent directories. Its git operations are limited to fetching from the agent clone and working in its own bare repos.
+  - Sudoers: `pace ALL=(pace-agent) CWD=* NOPASSWD: /home/pace-agent/.local/bin/claude, /usr/bin/git`. There's no `env` wrapper, which would allow anything. `CWD=*` permits `-D`.
+  - It has its own native `claude` install (auto-updates) and is logged in once with an interactive `/login` as `pace-agent`. Credentials refresh themselves, and no token passes through PACE.
+  - Its global `~/.claude/CLAUDE.md` comes from `scripts/agent-CLAUDE.md`: headless, no human reading; install tools into its home (uv, `pip --user`), never sudo; don't switch branches or push; leave the worktree clean; verify precisely. Auto-memory stays on.
+- PACE never executes code from agent directories. On the agent side it only runs `git` and `claude` through sudo; on its side it works only in its own bare repos and bundle files.
 - All Claude-produced text is rendered escaped.
-- The agent's `~/.claude` (global CLAUDE.md, settings, auto-memory) is set up deliberately rather than left empty or copied from mine. Decide in M0.
-- `scripts/setup-vm.sh` creates the users, the sudoers rule and the directories.
+- `scripts/setup-vm.sh` (idempotent, run with sudo) creates the agent user, the sudoers rule, the agent's CLAUDE.md and the data dir. Push credentials for `pace` are per-repo deploy keys behind SSH host aliases.
 
 ---
 
@@ -280,32 +289,10 @@ Every state transition is a single transaction that also writes an `events` row.
 
 ## 14. Milestones (each must be usable)
 
-- **M0 — Spike (CLI, no UI).** For one item on a real repo, a script that:
-  - creates an agent worktree through sudo;
-  - runs a planning pass with structured output, takes answers in the terminal and resumes the session;
-  - takes approval, then implements with skip-permissions;
-  - prints the verified list and the manual checks;
-  - fetches the branch into the canonical repo and merges with `merge-tree`.
-  
-  Record the exact working flags and answer the questions in §15. Also build `fake_claude`.
+- **M0 — Spike (CLI, no UI). ✓ Done 2026-10-10.** `python -m pace.spike` took a toy item and nkms #24 through plan → questions → approve → implement as `pace-agent` → push → `merge-tree` squash merge. Findings are folded into this version. `fake_claude` replays recorded runs. `pace/agent.py`, `pace/git.py`, `pace/prompts/` and `pace/schemas/` carry into M1. `pace/spike.py` gets deleted once M1 replaces it.
 - **M1 — Core, end to end in local mode.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge.
 - **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps.
-- **M3 — The rest.** PR mode, ntfy, import, proposed items, stale-plan flag.
+- **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, import, proposed items, stale-plan flag. Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
 - **M4 — Phone pass.** Layout polish for phone use.
 
 **Acceptance:** with two projects (one `local`, one `pr`), I import a roadmap and leave PACE running. Later I find plans and questions in the inbox, answer and approve them, and later still find branches ready to test with clear manual checks. I can merge both ways from the UI and never need a terminal.
-
----
-
-## 15. Verify in M0 (don't assume)
-
-1. `claude` CLI behaviour:
-   - `-p` with stream-json;
-   - `--json-schema`, and where structured output appears in the result;
-   - `--resume` across different permission modes, and whether it requires the same cwd;
-   - headless `--permission-mode plan`;
-   - disallowing `AskUserQuestion`;
-   - what a rate-limit or quota error looks like.
-2. Headless auth for `pace-agent` (`claude setup-token` or similar) within Anthropic's terms.
-3. Fetching from the agent-owned repo as `pace`: how `safe.directory` interacts with it, and confirm that no repo config or hooks execute.
-4. `gh pr ready` / `gh pr merge` behaviour on draft PRs.
