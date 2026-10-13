@@ -8,10 +8,12 @@ goes ahead of all other work. The rules that gate a single start
 them, it resumes the runs a restart interrupted (Runner.recover), in any
 window.
 
+With pause all on (kv `pause_all`, set from the System page) `tick` starts
+nothing at all, resumes included, as if every project were paused.
 Outside the run windows (pace/windows.py) and during a rate-limit backoff
 (`Runner.backoff`, §8.1) `tick` starts nothing new; runs already going finish.
 Interrupted runs resume outside the windows too, but not during a backoff.
-Human actions call pace/actions.py directly, so they bypass both.
+Human actions call pace/actions.py directly, so they bypass all three.
 
 `Scheduler` runs `tick` in a thread about every 10 s and whenever something is
 published on the bus's `global` topic (every state change).
@@ -26,12 +28,29 @@ from datetime import datetime
 from pace import actions as act
 from pace import items as it
 from pace import windows
+from pace.db import DB, now as db_now
 from pace.runs import Busy, Runner
 
 log = logging.getLogger("pace.scheduler")
 
 INTERVAL = 10.0
 _SKIP = (act.ActionError, it.InvalidTransition, Busy)
+PAUSE_KEY = "pause_all"
+
+
+def paused_all(db: DB) -> dict | None:
+    """`{"at": iso}` while pause all is on, else None."""
+    return db.kv_get(PAUSE_KEY)
+
+
+def set_paused_all(db: DB, on: bool) -> None:
+    if bool(paused_all(db)) == on:
+        return
+    if on:
+        db.kv_set(PAUSE_KEY, {"at": db_now()})
+    else:
+        db.run("DELETE FROM kv WHERE key = ?", PAUSE_KEY)
+    it.event(db, None, "pause_all" if on else "resume_all", "human")
 
 
 def _count(r: Runner, project_id: int, *states: str) -> int:
@@ -107,6 +126,8 @@ def _in_backoff(r: Runner) -> bool:
 
 def tick(r: Runner, now: datetime | None = None) -> list[tuple[str, str]]:
     """Start what §9 allows right now; returns the (item, kind) pairs started."""
+    if paused_all(r.db):
+        return []
     if _in_backoff(r):
         return []
     started: list[tuple[str, str]] = []
@@ -147,8 +168,13 @@ class Scheduler:
     async def _loop(self) -> None:
         assert self._q is not None
         was_open: bool | None = None
+        was_paused: bool | None = None
         while True:
             try:
+                paused = bool(paused_all(self.runner.db))
+                if was_paused is not None and paused != was_paused:
+                    log.info("pause all %s", "on" if paused else "off")
+                was_paused = paused
                 ws = windows.status(self.runner.cfg.run_windows)
                 if was_open is not None and ws.open != was_open:
                     if ws.open:

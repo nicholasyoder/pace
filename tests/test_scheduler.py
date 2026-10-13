@@ -9,7 +9,7 @@ import pytest
 from pace import actions as act
 from pace import items as it
 from pace.runs import RATE_LIMIT_FALLBACK, backoff
-from pace.scheduler import Scheduler, tick
+from pace.scheduler import Scheduler, paused_all, set_paused_all, tick
 
 
 def state(db, item_id):
@@ -224,6 +224,35 @@ def test_resume_ignores_windows_but_not_pause(db, runner, cfg, project, fake_sta
     assert state(db, item) == "failed" and it.interrupted(db, item)
     it.update_project(db, project["id"], paused=0)
     assert tick(runner, now=at(12)) == [(item, "resume"), (imp, "resume")]  # imports too
+
+
+def test_pause_all_gates_the_scheduler(db, runner, cfg, project, fake_start):
+    a = add(db, project, "a")
+    set_paused_all(db, True)
+    assert paused_all(db)["at"]
+    set_paused_all(db, True)  # idempotent: one event
+    assert tick(runner) == [] and fake_start == []
+    act.plan(runner, a)  # Plan now still works
+    assert fake_start == [(a, "plan")]
+    set_paused_all(db, False)
+    assert paused_all(db) is None and db.kv_get("pause_all") is None
+    b = add(db, project, "b")
+    assert tick(runner) == [(b, "plan")]
+    kinds = [e["kind"] for e in db.all("SELECT kind FROM events WHERE item_id IS NULL")]
+    assert kinds == ["pause_all", "resume_all"]
+
+
+def test_pause_all_holds_resumes_and_keeps_project_pause(db, runner, cfg, origin, project,
+                                                          fake_start):
+    item = add(db, project, "a")
+    interrupted(db, runner, item, "planning", "plan")
+    other = it.create_project(db, slug="ZED", name="Zed", origin=str(origin), base_branch="main",
+                              paused=1)
+    add(db, other, "z")
+    set_paused_all(db, True)
+    assert tick(runner) == []
+    set_paused_all(db, False)
+    assert tick(runner) == [(item, "resume")]  # ZED stays paused on its own
 
 
 def test_human_retry_wins(db, runner, project, fake_start):

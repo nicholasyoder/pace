@@ -257,6 +257,8 @@ Each tick runs the steps across all unpaused projects in turn (feedback in every
 
 **Controls:** pause project, pause all, plan now, move to top, park, retry.
 
+**Pause all:** a global switch on the System page, stored in `kv` (`pause_all`), so it survives restarts and deploys. While it's on, the scheduler starts nothing at all, interrupted-run resumes included, as if every project were paused; the nav shows "all paused". Runs in progress finish, and explicit human starts (the same list as for run windows) still run. Turning it off wakes the scheduler. Each switch writes a `pause_all` / `resume_all` event (no item).
+
 ---
 
 ## 10. Git
@@ -311,6 +313,8 @@ Each tick runs the steps across all unpaused projects in turn (feedback in every
 - `proposals(id, project_id, source_item_id, title, description, reason, status)`
 - `events(id, item_id, ts, kind, actor[system|human|claude], data_json)`: an append-only audit log that includes feedback text and approvals.
 
+- `kv(key, value)`: small global state as JSON: `rate_limit` (latest rate-limit info), `rate_limit_hit` (last rate-limited run), `pause_all` (`{"at"}` while pause all is on), `access:<slug>` (deploy-key check).
+
 Every state transition is a single transaction that also writes an `events` row.
 
 ---
@@ -325,7 +329,11 @@ Every state transition is a single transaction that also writes an `events` row.
    - **Test & merge:** summary, what Claude verified, the manual checks as a checklist, the diff, the branch/PR with a checkout command, and Works → merge / Problem….
    - **Activity:** events and runs, with the live stream for the current run.
 3. **Project page:** the roadmap as an ordered list with state badges, plus reorder, quick add, edit, park, edit as markdown, import, the settings form and pause.
-4. **System:** current runs, backoff and run-window status (open until X / closed, opens at Y), recent errors, usage per run.
+4. **System** (linked in the nav):
+   - **Scheduler:** the pause-all toggle, run-window status (open until X / closed, opens at Y), rate-limit backoff (reason and end) and the paused projects.
+   - **Current runs:** item, kind, started, a link to the run page, and Stop (the item's Stop run).
+   - **Recent errors:** the latest 50 `failed` / `interrupted` / `rate_limited` runs and `readonly_violation` / `dirty_worktree` events, newest first.
+   - **Usage:** cost totals for 24 h, 7 days and all time, and the last 50 runs with `cost_usd` and the token counts from `usage_json`.
 
 **Notifications:** an ntfy push when the inbox gains entries, at most one every N minutes, with a deep link.
 

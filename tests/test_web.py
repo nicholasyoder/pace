@@ -200,3 +200,41 @@ def test_backoff_banner(client, db):
                              "seen_at": "2026-10-10T12:00:00+00:00"})
     page = client.get("/").text
     assert "Rate-limit backoff" in page and "rejected" in page and "(in 2h 5m)" in page
+
+
+def test_pause_all_switch(client, db):
+    page = client.get("/").text
+    assert 'href="/system"' in page and "all paused" not in page
+    assert post(client, "/system/pause", on="1").status_code == 303
+    assert db.kv_get("pause_all") and "all paused" in client.get("/").text
+    assert "Resume" in client.get("/system").text
+    post(client, "/system/pause", on="0")
+    assert db.kv_get("pause_all") is None and "all paused" not in client.get("/").text
+
+
+def test_system_page_empty(client):
+    page = client.get("/system").text
+    assert "Nothing running." in page and "No recent errors." in page and "always open" in page
+    assert "Pause all" in page and "none" in page
+
+
+def test_system_page(client, db, runner, project, item, monkeypatch):
+    def run(status, **kw):
+        cols = {"item_id": item, "kind": "plan", "status": status,
+                "started_at": "2026-10-10T10:00:00+00:00", **kw}
+        db.run(f"INSERT INTO runs ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+               *cols.values())
+    run("running")
+    run("failed", error="contract violation: boom", ended_at="2026-10-10T10:05:00+00:00")
+    run("succeeded", cost_usd=0.42, usage_json=json.dumps(
+        {"input_tokens": 1234, "output_tokens": 56, "cache_read_input_tokens": None}))
+    it.event(db, item, "readonly_violation", "system",
+             {"run": 1, "message": "read-only run left changes; worktree reset"})
+    page = client.get("/system").text
+    assert item in page and "contract violation: boom" in page
+    assert "read-only run left changes" in page and "$0.42" in page and "in 1,234" in page
+    assert "cache read" not in page  # None is left out
+    assert "/cancel" not in page  # no live thread behind the running row
+    monkeypatch.setattr(runner, "busy", lambda i: i == item)
+    page = client.get("/system").text
+    assert f'action="/i/{item}/cancel"' in page and 'name="next" value="/system"' in page
