@@ -82,6 +82,27 @@ def test_plan_answer_implement_merge(tmp_path, db, runner, scenario, origin, ite
     assert scenario.left() == []
 
 
+def test_usage_is_stored_and_published_as_it_arrives(db, runner, scenario, item, monkeypatch):
+    seen = []
+    publish = runner.bus.publish
+
+    def record(topic, msg):
+        if msg.get("type") == "usage":
+            info = db.kv_get("rate_limit")
+            seen.append((topic, info["unifiedWindows"]["five_hour"]["utilization"],
+                         db.one("SELECT status FROM runs ORDER BY id DESC")["status"]))
+        publish(topic, msg)
+
+    monkeypatch.setattr(runner.bus, "publish", record)
+    scenario("plan_needs_input")
+    go(runner, act.plan, item)
+    # stored mid-run (the run is still `running`), and only published when the number moved
+    assert seen[:2] == [("global", 0.08, "running"), (f"item:{item}", 0.08, "running")]
+    fives = [u for t, u, _ in seen if t == "global"]
+    assert fives == [0.08, 0.09]
+    assert db.kv_get("rate_limit")["seen_at"]
+
+
 def test_problem_then_address_feedback(tmp_path, db, runner, scenario, origin, item):
     scenario("plan_ready", "implement_done",
              'implement_done {"summary": "fixed it", "manual_checks": ["look again"]}')

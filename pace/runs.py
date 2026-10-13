@@ -139,6 +139,71 @@ def backoff(info: Any, hit: Any, threshold: float, now_ts: float) -> Backoff | N
     return max(found, key=lambda b: b.until) if found else None
 
 
+WINDOWS = (("five_hour", "5h", "5-hour"), ("seven_day", "7d", "7-day"))
+
+
+@dataclass(frozen=True)
+class UsageWindow:
+    short: str  # "5h"
+    label: str  # "5-hour"
+    utilization: float  # 0..1; 0 once the window has reset since the data was seen
+    resets_at: float | None  # epoch seconds
+    reset: bool  # resets_at has passed: the stored utilization is out of date
+    level: str  # ok | warn | bad, against the backoff threshold
+
+
+@dataclass(frozen=True)
+class Usage:
+    status: str | None
+    allowed: bool
+    seen_at: str | None
+    resets_at: float | None
+    threshold: float
+    windows: list[UsageWindow]
+
+
+def usage_view(info: Any, threshold: float, now_ts: float) -> Usage | None:
+    """The latest rate_limit_info (kv `rate_limit`) shaped for the header (§13).
+
+    Loose like `backoff()`. A window whose reset has passed shows 0%: the
+    stored number predates the reset and only a new run brings a fresh one.
+    """
+    if not isinstance(info, dict):
+        return None
+    wins = info.get("unifiedWindows")
+    out = []
+    for key, short, label in WINDOWS:
+        w = wins.get(key) if isinstance(wins, dict) else None
+        u = _num(w.get("utilization")) if isinstance(w, dict) else None
+        if u is None:
+            continue
+        resets = _num(w.get("resetsAt"))  # type: ignore[union-attr]
+        reset = resets is not None and resets <= now_ts
+        u = 0.0 if reset else min(max(u, 0.0), 1.0)
+        level = "bad" if u >= threshold else "warn" if u >= threshold * 0.75 else "ok"
+        out.append(UsageWindow(short, label, u, resets, reset, level))
+    status = info.get("status") if isinstance(info.get("status"), str) else None
+    seen = info.get("seen_at") if isinstance(info.get("seen_at"), str) else None
+    if not out and status is None:
+        return None
+    return Usage(status, status in (None, "allowed"), seen, _num(info.get("resetsAt")),
+                 threshold, out)
+
+
+def usage_sig(info: Any) -> tuple:
+    """What the usage indicator shows of `info`: a new event that matches needs no update."""
+    if not isinstance(info, dict):
+        return ()
+    wins = info.get("unifiedWindows")
+    sig: list = [info.get("status"), info.get("resetsAt")]
+    for key, _, _ in WINDOWS:
+        w = wins.get(key) if isinstance(wins, dict) else None
+        if isinstance(w, dict):
+            u = _num(w.get("utilization"))
+            sig += [round(u * 100) if u is not None else None, w.get("resetsAt")]
+    return tuple(sig)
+
+
 def resume_failed(r: RunResult) -> bool:
     """The session couldn't be resumed (e.g. it was created on another VM).
 
@@ -249,6 +314,16 @@ class Runner:
         self.bus.publish(f"item:{item_id}", msg)
         if msg["type"] != "stream":
             self.bus.publish("global", {"type": "changed", "item": item_id})
+
+    def _usage(self, info: Any, item_id: str) -> None:
+        """Store a rate_limit_info as it arrives and tell open pages, if what they show changed."""
+        if not isinstance(info, dict):
+            return
+        changed = usage_sig(info) != usage_sig(self.db.kv_get("rate_limit"))
+        self.db.kv_set("rate_limit", {**info, "seen_at": now()})
+        if changed:
+            self.bus.publish("global", {"type": "usage"})
+            self.bus.publish(f"item:{item_id}", {"type": "usage"})
 
     # --- threads ------------------------------------------------------------------
 
@@ -398,6 +473,9 @@ class Runner:
             self.db.run("UPDATE runs SET status = 'running', pid = ? WHERE id = ?", proc.pid, run_id)
 
         def on_event(e: dict) -> None:
+            if e.get("type") == "rate_limit_event":
+                self._usage(e.get("rate_limit_info"), item_id)
+                return
             line = activity_line(e)
             if line:
                 self.publish(item_id, {"type": "stream", "run": run_id, "line": line})
@@ -406,8 +484,8 @@ class Runner:
             r = self.agent.claude_run(p, cwd=wt, schema=schema, mode=mode, resume=resume,
                                       model=proj["model"], log_path=log, on_event=on_event,
                                       on_start=on_start)
-            if r.rate_limit:
-                self.db.kv_set("rate_limit", {**r.rate_limit, "seen_at": now()})
+            if r.rate_limit:  # usually already stored by on_event; this is the fallback
+                self._usage(r.rate_limit, item_id)
             return r
 
         # one retry (§8.1), for a failed run or for output that breaks the contract
