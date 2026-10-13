@@ -626,8 +626,8 @@ class Runner:
                 continue
             known.add(p["title"].casefold())
             self.db.run("INSERT INTO proposals (project_id, source_item_id, title, description, "
-                        "reason) VALUES (?, ?, ?, ?, ?)", proj["id"], item["id"], p["title"],
-                        p.get("description", ""), p.get("reason", ""))
+                        "reason, created_at) VALUES (?, ?, ?, ?, ?, ?)", proj["id"], item["id"],
+                        p["title"], p.get("description", ""), p.get("reason", ""), now())
 
     # --- merge -------------------------------------------------------------------
 

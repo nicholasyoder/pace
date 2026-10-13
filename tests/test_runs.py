@@ -184,6 +184,12 @@ def test_revise_plan_and_proposals(db, runner, scenario, project, item):
     assert state(db, item) == "plan_ready"
     assert [r["version"] for r in db.all("SELECT version FROM plans")] == [1, 2]
     assert db.one("SELECT COUNT(*) FROM proposals")[0] == 1  # deduped by title
+    pid = db.one("SELECT id, created_at FROM proposals")
+    assert pid["created_at"]
+    it.dismiss_proposal(db, pid["id"])
+    scenario(f'plan_ready {json.dumps({"proposed_items": [dict(prop, title="ADD TESTS")]})}')
+    go(runner, act.revise_plan, item, "again")
+    assert db.one("SELECT COUNT(*) FROM proposals")[0] == 1  # dismissed titles stay out
     act.park(runner, item)
     act.unpark(runner, item)
     assert state(db, item) == "backlog"
