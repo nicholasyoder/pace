@@ -139,6 +139,13 @@ def merge_local(p: Project, item_id: str, message: str, strategy: str = "squash"
         if proc.returncode != 0:
             raise GitError(f"merge-tree: {proc.stderr.strip()}")
         tree = proc.stdout.split("\n", 1)[0].strip()
+        # already in the base (a merge retried after its push landed): don't commit again
+        if strategy == "squash":
+            merged = tree == git("rev-parse", f"{base}^{{tree}}", cwd=p.canonical)
+        else:
+            merged = is_ancestor(p, b, base)
+        if merged:
+            return MergeResult(True, commit=base)
         parents = ["-p", base] + (["-p", git("rev-parse", b, cwd=p.canonical)]
                                   if strategy == "merge" else [])
         commit = git("commit-tree", tree, *parents, "-m", message, cwd=p.canonical)
