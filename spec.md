@@ -134,7 +134,7 @@ headings inside it must be `###` or deeper.
   - **Review:** the item page shows Claude's notes and a structured preview, grouped, with kinds, dependencies and parked items. Feedback and answers resume the session.
   - **Applying:** "Apply to roadmap" adds the items after the existing roadmap with fresh IDs and dependencies remapped. A non-empty preamble replaces the project's. The import then moves straight from `plan_ready` to `merged`; nothing is committed.
   - **Visibility:** imports never appear in the roadmap list or the markdown view.
-- **Proposed items:** any run can propose new items or splits (§8.2). They appear in the inbox, where I accept them (they're added to the roadmap) or dismiss them.
+- **Proposed items:** any run can propose new items or splits (§8.2). A title already proposed (open, accepted or dismissed) or already on the roadmap is skipped, case-insensitively. They appear in the inbox, where I accept or dismiss them. **Accept** adds the item to the end of a group I choose (the default is the same as quick add), in `backlog`. Its description is the proposal's, followed by a "Proposed by SRC-ID: reason" line. **Dismiss** removes it from the inbox for good, and runs can't propose that title again. The source item's page lists its proposals and links accepted ones to their new item.
 
 ---
 
@@ -157,7 +157,7 @@ headings inside it must be `###` or deeper.
 
 **Dependencies:** an item can be planned once all its dependencies are at least `approved`; their plans go to Claude as context. It can be implemented only once they are all `merged`. Unmet dependencies are not a state: the scheduler skips the item and its page shows "waiting on WEB-003".
 
-**Inbox** = `needs_input`, `plan_ready`, `ready_to_test`, `failed`, plus proposed items. Each card shows age and Claude's summary.
+**Inbox** = `needs_input`, `plan_ready`, `ready_to_test`, `failed`, plus open proposed items. Each card shows age and Claude's summary (for a proposal: its reason and source item).
 
 **Stale plans:** when an item merges, any `plan_ready` or `approved` item whose plan lists `affected_files` that the merge changed is flagged "plan may be stale", with the overlapping files listed. I can trigger a `revise_plan` run from there. Nothing is discarded automatically.
 
@@ -310,7 +310,7 @@ Each tick runs the steps across all unpaused projects in turn (feedback in every
 - `plans(item_id, version, markdown, affected_files_json, created_at)`
 - `qa_rounds(item_id, round, questions_json, answers_json, answered_at)`
 - `runs(id, item_id, kind, input_json, status[queued|running|succeeded|failed|interrupted|rate_limited], pid, session_id, started_at, ended_at, exit_code, cost_usd, usage_json, output_json, log_path, error)`
-- `proposals(id, project_id, source_item_id, title, description, reason, status)`
+- `proposals(id, project_id, source_item_id, title, description, reason, status, created_at, decided_at, item_id)` (`item_id`: the item an accepted proposal became)
 - `events(id, item_id, ts, kind, actor[system|human|claude], data_json)`: an append-only audit log that includes feedback text and approvals.
 
 - `kv(key, value)`: small global state as JSON: `rate_limit` (latest rate-limit info), `rate_limit_hit` (last rate-limited run), `pause_all` (`{"at"}` while pause all is on), `access:<slug>` (deploy-key check).
@@ -321,7 +321,7 @@ Every state transition is a single transaction that also writes an `events` row.
 
 ## 13. UI
 
-1. **Inbox** (default; all projects, with a project filter). Groups: *Questions*, *Plans to approve*, *Ready to test*, *Problems*, *Proposed items*. The count shows in the nav and the page title.
+1. **Inbox** (default; all projects, with a project filter). Groups: *Questions*, *Plans to approve*, *Ready to test*, *Problems*, *Proposed items*. The count (inbox items plus open proposals, across all projects) shows in the nav and the page title.
 2. **Item page**:
    - Header with state and the primary action.
    - **Questions:** radio options with the recommended one highlighted (not pre-selected), "why it matters", a free-text field, and "let Claude decide the rest".
@@ -344,7 +344,7 @@ Every state transition is a single transaction that also writes an `events` row.
 - **M0 — Spike (CLI, no UI). ✓ Done 2026-10-10.** `python -m pace.spike` took a toy item and nkms #24 through plan → questions → approve → implement as `pace-agent` → push → `merge-tree` squash merge. Findings are folded into this version. `fake_claude` replays recorded runs. `pace/agent.py`, `pace/git.py`, `pace/prompts/` and `pace/schemas/` carry into M1. `pace/spike.py` gets deleted once M1 replaces it.
 - **M1 — Core, end to end in local mode. ✓ Built 2026-10-10.** DB, roadmap parser and markdown editing, project add, state machine, run manager, inbox and item page, SSE, local merge, `address_feedback` and `resolve_conflicts`. It was proven with real `claude` as `pace-agent` on a toy repo through plan → implement → Problem → fix → squash merge. Not in M1: the System page (moves to M2) and the proposal inbox actions (M3; proposals are stored and shown on the item page, deduped by title). Runs as `dev` via `uv run python -m pace` until the `pace` user and a systemd unit arrive at the end of M2.
 - **M2 — Scheduler.** Pipeline, dependencies, `test_ahead`, run windows, backoff, restart recovery, attempt caps, the System page, and the `pace` user plus a systemd unit.
-- **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, proposed items, stale-plan flag. (Import, groups, kinds and the preamble came forward and were built 2026-10-10.) Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
+- **M3 — The rest.** PR mode (first check `gh pr ready` / `gh pr merge` behaviour on draft PRs), ntfy, proposed items (✓ built 2026-10-13), stale-plan flag. (Import, groups, kinds and the preamble came forward and were built 2026-10-10.) Runs often re-propose items an earlier run already proposed, so dedupe by title against open and dismissed proposals.
 - **M4 — Phone pass.** Layout polish for phone use.
 
 **Acceptance:** with two projects (one `local`, one `pr`), I import a roadmap and leave PACE running. Later I find plans and questions in the inbox, answer and approve them, and later still find branches ready to test with clear manual checks. I can merge both ways from the UI and never need a terminal.
