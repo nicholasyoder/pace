@@ -8,6 +8,7 @@ import pytest
 
 from pace import actions as act
 from pace import items as it
+from pace.runs import RATE_LIMIT_FALLBACK, backoff
 from pace.scheduler import Scheduler, tick
 
 
@@ -192,3 +193,70 @@ def test_window_closing_leaves_runs_and_manual_starts_alone(db, runner, cfg, pro
     assert state(db, a) == "planning" and fake_start == [(a, "plan")]  # a keeps going
     act.plan(runner, c)  # Plan now bypasses the window
     assert fake_start == [(a, "plan"), (c, "plan")] and state(db, b) == "backlog"
+
+
+# --- rate-limit backoff (§8.1) ---------------------------------------------------
+
+NOW = 1_800_000_000.0
+
+
+def info(status="allowed", resets=None, five=None, seven=None, **extra):
+    wins = {}
+    if five is not None:
+        wins["five_hour"] = {"utilization": five[0], "resetsAt": five[1]}
+    if seven is not None:
+        wins["seven_day"] = {"utilization": seven[0], "resetsAt": seven[1]}
+    return {"status": status, "resetsAt": resets, "unifiedWindows": wins, **extra}
+
+
+def test_backoff_rules():
+    assert backoff(None, None, 0.9, NOW) is None
+    assert backoff(info(five=(0.5, NOW + 100), seven=(0.3, NOW + 999)), None, 0.9, NOW) is None
+    b = backoff(info("rejected", NOW + 600), None, 0.9, NOW)
+    assert b.until == NOW + 600 and "rejected" in b.reason
+    assert backoff(info("rejected", NOW - 1), None, 0.9, NOW) is None  # stale: over
+    seen = datetime.fromtimestamp(NOW - 60).astimezone().isoformat()
+    b = backoff(info("rejected", seen_at=seen), None, 0.9, NOW)
+    assert b.until == NOW - 60 + RATE_LIMIT_FALLBACK
+    b = backoff(info(five=(0.9, NOW + 100)), None, 0.9, NOW)
+    assert b.until == NOW + 100 and "5-hour usage at 90%" in b.reason
+    b = backoff(info(five=(0.2, NOW + 100), seven=(0.95, NOW + 9000)), None, 0.9, NOW)
+    assert b.until == NOW + 9000 and "7-day" in b.reason
+    b = backoff(info("rejected", NOW + 50, five=(0.99, NOW + 100)), None, 0.9, NOW)
+    assert b.until == NOW + 100  # the latest end wins
+    b = backoff(info(five=(0.95, None)), None, 0.9, NOW)
+    assert b is None  # no reset time anywhere
+    b = backoff(info(resets=NOW + 70, five=(0.95, None)), None, 0.9, NOW)
+    assert b.until == NOW + 70  # falls back to the top-level resetsAt
+    b = backoff(None, {"at": NOW - 10, "item": "TOY-001"}, 0.9, NOW)
+    assert b.until == NOW - 10 + RATE_LIMIT_FALLBACK and "TOY-001" in b.reason
+    assert backoff(None, {"at": NOW - RATE_LIMIT_FALLBACK - 1}, 0.9, NOW) is None
+    for junk in ("x", [], {"status": None, "unifiedWindows": "?"},
+                 {"status": "allowed", "unifiedWindows": {"five_hour": {"utilization": "hi"}}},
+                 {"status": "rejected", "resetsAt": "soon", "seen_at": "yesterday"}):
+        assert backoff(junk, {"at": "?"}, 0.9, NOW) is None
+
+
+def test_backoff_gates_the_scheduler(db, runner, cfg, project, fake_start):
+    a = add(db, project, "a")
+    soon = time.time() + 600
+    db.kv_set("rate_limit", info("rejected", soon))
+    assert tick(runner) == []
+    db.kv_set("rate_limit", info("rejected", time.time() - 1))  # reset has passed
+    db.kv_set("rate_limit", info(five=(0.95, soon)))
+    assert tick(runner) == []
+    cfg.rate_limit_threshold = 0.99
+    assert tick(runner) == [(a, "plan")]
+
+
+def test_rate_limited_run_holds_the_scheduler(db, runner, cfg, scenario, project):
+    a = add(db, project, "a")
+    scenario("ratelimited -")
+    tick(runner)
+    runner.wait()
+    assert state(db, a) == "backlog"
+    assert tick(runner) == []  # no immediate restart loop
+    db.run("DELETE FROM kv")  # the limit has reset
+    scenario("plan_ready")
+    assert drain(runner) == [(a, "plan")]
+    assert state(db, a) == "plan_ready"

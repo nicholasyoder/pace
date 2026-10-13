@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -191,3 +192,11 @@ def test_run_window_pill(client, cfg):
     cfg.run_windows = ["00:00-12:00", "12:00-23:59"]
     page = client.get("/").text
     assert "paused until" in page or "window until" in page
+
+
+def test_backoff_banner(client, db):
+    assert "Rate-limit backoff" not in client.get("/").text
+    db.kv_set("rate_limit", {"status": "rejected", "resetsAt": time.time() + 7530,
+                             "seen_at": "2026-10-10T12:00:00+00:00"})
+    page = client.get("/").text
+    assert "Rate-limit backoff" in page and "rejected" in page and "(in 2h 5m)" in page

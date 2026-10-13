@@ -271,3 +271,73 @@ def test_moved_to_new_vm(tmp_path, db, runner, scenario, origin, item):
     shutil.rmtree(runner.cfg.data_dir / "repos")
     go(runner, act.merge, item)
     assert state(db, item) == "merged"
+
+
+# --- rate limits (§8.1): the item goes back to where it was --------------------
+
+def limited(db, runner, item, back_in):
+    row = it.item(db, item)
+    assert row["state"] == back_in and row["last_error"].startswith("rate limited; back in")
+    assert runs(db, item)[-1][1] == "rate_limited"
+    assert db.kv_get("rate_limit_hit")["item"] == item
+    assert db.kv_get("rate_limit")["status"] == "rejected"
+    assert runner.backoff() is not None
+
+
+def test_rate_limited_plan_goes_back_to_backlog(db, runner, scenario, item):
+    scenario("ratelimited -", "plan_ready")
+    go(runner, act.plan, item)
+    limited(db, runner, item, "backlog")
+    go(runner, act.plan, item)  # picked up again later
+    assert state(db, item) == "plan_ready"
+
+
+def test_rate_limited_implement_and_feedback(db, runner, scenario, item):
+    scenario("plan_ready", "ratelimited -", "implement_done", "ratelimited -", "implement_done")
+    go(runner, act.plan, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
+    limited(db, runner, item, "approved")
+    go(runner, act.implement, item)
+    assert state(db, item) == "ready_to_test"
+    act.problem(runner, item, "still broken")
+    go(runner, act.address_feedback, item)
+    limited(db, runner, item, "changes_requested")
+    go(runner, act.address_feedback, item)
+    assert state(db, item) == "ready_to_test"
+
+
+def test_rate_limited_answers_and_revise(db, runner, scenario, item):
+    scenario("plan_needs_input", "ratelimited -", "plan_ready", "ratelimited -")
+    go(runner, act.plan, item)
+    go(runner, act.answer, item, {}, True)
+    limited(db, runner, item, "needs_input")
+    go(runner, act.answer, item, {}, True)  # the open round can be answered again
+    assert state(db, item) == "plan_ready"
+    act.approve(runner, item)
+    go(runner, act.revise_plan, item, "smaller please")
+    limited(db, runner, item, "approved")
+
+
+def test_rate_limited_conflict_resolution(tmp_path, db, runner, scenario, origin, item):
+    scenario("plan_ready", "implement_done", "ratelimited -", "resolve implement_done")
+    go(runner, act.plan, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
+    push_to_origin(tmp_path, origin, "fake_change.txt", "someone else's version\n")
+    go(runner, act.merge, item)
+    limited(db, runner, item, "ready_to_test")
+    go(runner, act.merge, item)
+    assert state(db, item) == "ready_to_test" and it.item(db, item)["reverify"] == 1
+
+
+def test_rate_limited_retry_stays_failed(db, runner, scenario, item):
+    scenario("invalid plan_ready", "invalid plan_ready", "ratelimited -", "plan_ready")
+    go(runner, act.plan, item)
+    assert state(db, item) == "failed"
+    go(runner, act.retry, item)
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "rate limited" in row["last_error"]
+    assert it.failed_from(db, item) == "planning"
+    go(runner, act.retry, item)
+    assert state(db, item) == "plan_ready"

@@ -23,11 +23,12 @@ INBOX = ["needs_input", "plan_ready", "ready_to_test", "failed"]
 
 ALLOWED: dict[str, set[str]] = {
     "backlog": {"planning", "parked"},
-    "planning": {"needs_input", "plan_ready", "failed"},
+    # planning / implementing → backlog, approved, …: a rate-limited run goes back (§8.1)
+    "planning": {"needs_input", "plan_ready", "failed", "backlog", "approved"},
     "needs_input": {"planning", "parked"},
     "plan_ready": {"approved", "planning", "parked", "merged"},  # → merged: imports only
     "approved": {"implementing", "planning", "parked"},
-    "implementing": {"ready_to_test", "failed"},
+    "implementing": {"ready_to_test", "failed", "approved", "changes_requested"},
     "ready_to_test": {"merging", "changes_requested", "parked"},
     "changes_requested": {"implementing", "parked"},
     "merging": {"merged", "implementing", "ready_to_test", "failed"},
@@ -471,14 +472,19 @@ def update(db: DB, item_id: str, **fields: Any) -> None:
            item_id)
 
 
-def failed_from(db: DB, item_id: str) -> str | None:
-    """The state an item was in when it last moved to `failed` (what Retry returns to)."""
+def came_from(db: DB, item_id: str, state: str) -> str | None:
+    """The state an item was in when it last moved into `state`."""
     for r in db.all("SELECT data_json FROM events WHERE item_id = ? AND kind = 'state' "
                     "ORDER BY id DESC", item_id):
         d = json.loads(r["data_json"])
-        if d.get("to") == "failed":
+        if d.get("to") == state:
             return d["from"]
     return None
+
+
+def failed_from(db: DB, item_id: str) -> str | None:
+    """The state an item was in when it last moved to `failed` (what Retry returns to)."""
+    return came_from(db, item_id, "failed")
 
 
 def unmet_dependencies(db: DB, it: sqlite3.Row, need: str) -> list[str]:
