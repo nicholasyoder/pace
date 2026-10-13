@@ -180,3 +180,54 @@ def test_import_check_and_apply(db, proj):
     assert it.project(db, proj["id"])["preamble"] == "Framing."
     assert [r["title"] for r in it.items(db, proj["id"], active_only=True)] == [
         "Existing", "Sneaks in and takes WEB-002", "First", "Second"]
+
+
+def propose(db, proj, title, source, reason="because", description="Do it."):
+    return db.run("INSERT INTO proposals (project_id, source_item_id, title, description, reason) "
+                  "VALUES (?, ?, ?, ?, ?)", proj["id"], source, title, description,
+                  reason).lastrowid
+
+
+def test_default_group(db, proj):
+    assert it.default_group(db, proj["id"]) is None
+    db.run("INSERT INTO groups (project_id, position, title) VALUES (?, 0, 'Now'), (?, 1, 'Later')",
+           proj["id"], proj["id"])
+    now_, later = [g["id"] for g in it.groups(db, proj["id"])]
+    assert it.default_group(db, proj["id"]) == later  # no active items: the last group
+    a = it.add_item(db, proj["id"], "A", group_id=now_)
+    assert it.default_group(db, proj["id"]) == now_  # the last group with active items
+    it.transition(db, a, "parked", "human")
+    assert it.default_group(db, proj["id"]) == later
+
+
+def test_accept_and_dismiss_proposals(db, proj):
+    db.run("INSERT INTO groups (project_id, position, title) VALUES (?, 0, 'Now'), (?, 1, 'Later')",
+           proj["id"], proj["id"])
+    now_, later = [g["id"] for g in it.groups(db, proj["id"])]
+    src = it.add_item(db, proj["id"], "Source", group_id=now_)
+    first = it.add_item(db, proj["id"], "Already later", group_id=later)
+    a = propose(db, proj, "Split off docs", src)
+    b = propose(db, proj, "Drop the cache", src, reason="")
+    assert [p["id"] for p in it.open_proposals(db)] == [a, b]
+
+    new = it.accept_proposal(db, a, later)
+    row = it.item(db, new)
+    assert (row["title"], row["group_id"], row["state"]) == ("Split off docs", later, "backlog")
+    assert row["description"] == f"Do it.\n\nProposed by {src}: because"
+    assert [r["id"] for r in it.items(db, proj["id"]) if r["group_id"] == later] == [first, new]
+    assert "proposal_accepted" in [e["kind"] for e in it.events(db, new)]
+    p = db.one("SELECT * FROM proposals WHERE id = ?", a)
+    assert (p["status"], p["item_id"]) == ("accepted", new) and p["decided_at"]
+    with pytest.raises(ValueError, match="already accepted"):
+        it.accept_proposal(db, a, later)
+    with pytest.raises(ValueError, match="already accepted"):
+        it.dismiss_proposal(db, a)
+
+    it.dismiss_proposal(db, b)
+    assert db.one("SELECT status FROM proposals WHERE id = ?", b)[0] == "dismissed"
+    assert it.open_proposals(db) == []
+    with pytest.raises(ValueError, match="already dismissed"):
+        it.accept_proposal(db, b, None)
+    with pytest.raises(ValueError, match="unknown group"):  # nothing half-done
+        it.accept_proposal(db, propose(db, proj, "Third", src), 999)
+    assert [p["title"] for p in it.open_proposals(db)] == ["Third"]

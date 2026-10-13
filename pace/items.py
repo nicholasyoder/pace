@@ -422,6 +422,60 @@ def apply_import(db: DB, project_id: int, text: str, source: str) -> list[str]:
     return created
 
 
+# --- proposed items (§6) ------------------------------------------------------------
+
+def default_group(db: DB, project_id: int) -> int | None:
+    """Where quick add and accepted proposals go by default: the last group with
+    active items, else the last group, else ungrouped."""
+    gs = groups(db, project_id)
+    used = {r["group_id"] for r in items(db, project_id, active_only=True)}
+    pick = [g for g in gs if g["id"] in used] or gs
+    return pick[-1]["id"] if pick else None
+
+
+def open_proposals(db: DB, project_id: int | None = None) -> list[sqlite3.Row]:
+    sql = ("SELECT proposals.*, projects.slug AS project_slug, projects.name AS project_name "
+           "FROM proposals JOIN projects ON projects.id = proposals.project_id "
+           "WHERE proposals.status = 'open'")
+    args: list[Any] = []
+    if project_id is not None:
+        sql += " AND proposals.project_id = ?"
+        args.append(project_id)
+    return db.all(sql + " ORDER BY COALESCE(proposals.created_at, ''), proposals.id", *args)
+
+
+def _open_proposal(db: DB, proposal_id: int) -> sqlite3.Row:
+    row = db.one("SELECT * FROM proposals WHERE id = ?", proposal_id)
+    if row is None:
+        raise NotFound(f"proposal {proposal_id}")
+    if row["status"] != "open":
+        raise ValueError(f"“{row['title']}” is already {row['status']}")
+    return row
+
+
+def accept_proposal(db: DB, proposal_id: int, group_id: int | None) -> str:
+    """Add a proposed item to the end of a group; returns the new item's ID."""
+    with db.tx():
+        p = _open_proposal(db, proposal_id)
+        note = f"Proposed by {p['source_item_id'] or 'a run'}" + (
+            f": {p['reason'].strip()}" if p["reason"].strip() else ".")
+        desc = "\n\n".join(x for x in (p["description"].strip(), note) if x)
+        item_id = add_item(db, p["project_id"], p["title"], desc, group_id=group_id)
+        event(db, item_id, "proposal_accepted", "human",
+              {"proposal": proposal_id, "source": p["source_item_id"]})
+        db.run("UPDATE proposals SET status = 'accepted', item_id = ?, decided_at = ? WHERE id = ?",
+               item_id, now(), proposal_id)
+    return item_id
+
+
+def dismiss_proposal(db: DB, proposal_id: int) -> None:
+    """Dismissed proposals stay stored, so runs never re-propose the title."""
+    with db.tx():
+        _open_proposal(db, proposal_id)
+        db.run("UPDATE proposals SET status = 'dismissed', decided_at = ? WHERE id = ?", now(),
+               proposal_id)
+
+
 # --- state machine --------------------------------------------------------------
 
 def event(db: DB, item_id: str | None, kind: str, actor: str, data: dict | None = None) -> None:

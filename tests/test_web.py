@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pace import items as it
+from pace.db import now
 from pace.main import create_app
 
 
@@ -52,7 +53,7 @@ def test_full_flow_through_ui(client, db, runner, scenario, project, item):
     post(client, f"/i/{item}/plan", runner)
     page = client.get(f"/i/{item}").text
     assert "needs input" in page and 'name="q_q1_format"' in page
-    assert client.get("/").text.count(f"/i/{item}") == 1  # in the inbox
+    assert client.get("/").text.count(f'href="/i/{item}"') == 2  # in the inbox; its proposal too
 
     # nothing chosen and not delegated → error shown, state unchanged
     r = post(client, f"/i/{item}/answer")
@@ -121,7 +122,7 @@ def test_pages_render(client, db, runner, scenario, project, item):
     post(client, f"/i/{item}/plan", runner)
     page = client.get(f"/i/{item}").text
     assert "Retry" in page and "Claude is blocked" in page
-    assert re.search(r"<title>\(1\) ", client.get("/").text)  # inbox count in title
+    assert re.search(r"<title>\(2\) ", client.get("/").text)  # the item + its proposal
     for url in ("/", "/?project=TOY", "/p/TOY?show=all", "/projects/new", "/p/TOY/settings"):
         assert client.get(url).status_code == 200, url
     assert client.get("/i/NOPE-001").status_code == 404
@@ -238,3 +239,41 @@ def test_system_page(client, db, runner, project, item, monkeypatch):
     monkeypatch.setattr(runner, "busy", lambda i: i == item)
     page = client.get("/system").text
     assert f'action="/i/{item}/cancel"' in page and 'name="next" value="/system"' in page
+
+
+def test_proposals_in_the_inbox(client, db, project, item):
+    def propose(title, pid=project["id"]):
+        return db.run("INSERT INTO proposals (project_id, source_item_id, title, description, "
+                      "reason, created_at) VALUES (?, ?, ?, 'Desc', 'Why', ?)", pid, item, title,
+                      now()).lastrowid
+
+    db.run("INSERT INTO groups (project_id, position, title) VALUES (?, 0, 'Later')",
+           project["id"])
+    later = it.groups(db, project["id"])[0]["id"]
+    a, b = propose("Split off docs"), propose("Drop the cache")
+    page = client.get("/").text
+    assert "Proposed items" in page and "Split off docs" in page
+    assert re.search(r"<title>\(2\) ", page)  # nothing else in the inbox
+    assert f'<option value="{later}" selected>' in page  # the default, as in quick add
+
+    r = post(client, f"/proposals/{a}/accept", group_id=str(later), next="/?project=TOY")
+    assert r.status_code == 303 and r.headers["location"] == "/?project=TOY"
+    new = db.one("SELECT item_id FROM proposals WHERE id = ?", a)[0]
+    assert it.item(db, new)["group_id"] == later
+    assert f"accepted as <a href=\"/i/{new}\">" in client.get(f"/i/{item}").text
+    assert post(client, f"/proposals/{a}/accept", group_id="").status_code == 409
+
+    assert post(client, f"/proposals/{b}/dismiss").status_code == 303
+    page = client.get("/").text
+    assert "Proposed items" not in page and "<title>(" not in page
+    assert post(client, "/proposals/999/dismiss").status_code == 404
+    assert post(client, f"/proposals/{b}/frobnicate").status_code == 404
+
+
+def test_proposals_follow_the_project_filter(client, db, origin, project, item):
+    other = it.create_project(db, slug="OTH", name="Other", origin=str(origin))
+    db.run("INSERT INTO proposals (project_id, title) VALUES (?, 'Mine'), (?, 'Theirs')",
+           project["id"], other["id"])
+    page = client.get("/?project=TOY").text
+    assert "Mine" in page and "Theirs" not in page
+    assert re.search(r"<title>\(2\) ", page)  # the nav count is global

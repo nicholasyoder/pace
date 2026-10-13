@@ -48,9 +48,7 @@
   {% if groups %}
   <select name="group_id" title="group" class="group-select">
     <option value="">(ungrouped)</option>
-    {% set used = rows|map(attribute='group_id')|select|list %}
-    {% set default = (groups|selectattr('id', 'in', used)|list or groups)|last %}
-    {% for g in groups %}<option value="{{ g.id }}" {% if g.id == default.id %}selected{% endif %}>{{ g.title }}</option>{% endfor %}
+    {% for g in groups %}<option value="{{ g.id }}" {% if g.id == default_group %}selected{% endif %}>{{ g.title }}</option>{% endfor %}
   </select>
   {% endif %}
   <label class="check"><input type="checkbox" name="top" value="1"> top</label>

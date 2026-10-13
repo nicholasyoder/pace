@@ -7,7 +7,7 @@ from pace.db import DB
 def test_migrate_is_idempotent(tmp_path):
     db = DB(tmp_path / "pace.db")
     db.migrate()
-    assert db.one("PRAGMA user_version")[0] == 2
+    assert db.one("PRAGMA user_version")[0] == 3
     assert {r["name"] for r in db.all("SELECT name FROM sqlite_master WHERE type='table'")} >= {
         "projects", "items", "plans", "qa_rounds", "runs", "proposals", "events", "kv", "groups"}
 
