@@ -195,6 +195,44 @@ def test_window_closing_leaves_runs_and_manual_starts_alone(db, runner, cfg, pro
     assert fake_start == [(a, "plan"), (c, "plan")] and state(db, b) == "backlog"
 
 
+def interrupted(db, runner, item_id, to, kind):
+    it.transition(db, item_id, to, "human")
+    db.run("INSERT INTO runs (item_id, kind, input_json, status) VALUES (?, ?, '{}', 'running')",
+           item_id, kind)
+    runner.recover()
+
+
+def test_interrupted_runs_resume_first(db, runner, cfg, project, fake_start):
+    cfg.concurrency = 1
+    fix = add(db, project, "fix me")
+    set_state(db, fix, "changes_requested")
+    cut = add(db, project, "cut short")
+    interrupted(db, runner, cut, "planning", "plan")
+    assert tick(runner) == [(cut, "resume")]
+    assert fake_start == [(cut, "plan")] and state(db, cut) == "planning"
+    assert tick(runner) == []  # no double start while it runs
+
+
+def test_resume_ignores_windows_but_not_pause(db, runner, cfg, project, fake_start):
+    cfg.run_windows = ["22:00-08:00"]
+    item = add(db, project, "a")
+    imp = it.add_import(db, project["id"])
+    interrupted(db, runner, item, "planning", "plan")
+    interrupted(db, runner, imp, "planning", "import")
+    it.update_project(db, project["id"], paused=1)
+    assert tick(runner, now=at(23)) == []
+    assert state(db, item) == "failed" and it.interrupted(db, item)
+    it.update_project(db, project["id"], paused=0)
+    assert tick(runner, now=at(12)) == [(item, "resume"), (imp, "resume")]  # imports too
+
+
+def test_human_retry_wins(db, runner, project, fake_start):
+    item = add(db, project, "a")
+    interrupted(db, runner, item, "planning", "plan")
+    act.retry(runner, item)
+    assert tick(runner) == [] and fake_start == [(item, "plan")]
+
+
 # --- rate-limit backoff (§8.1) ---------------------------------------------------
 
 NOW = 1_800_000_000.0
@@ -259,4 +297,21 @@ def test_rate_limited_run_holds_the_scheduler(db, runner, cfg, scenario, project
     db.run("DELETE FROM kv")  # the limit has reset
     scenario("plan_ready")
     assert drain(runner) == [(a, "plan")]
+    assert state(db, a) == "plan_ready"
+
+
+def test_resume_waits_out_a_backoff(db, runner, cfg, scenario, project):
+    a = add(db, project, "a")
+    interrupted(db, runner, a, "planning", "plan")
+    db.kv_set("rate_limit", info("rejected", time.time() + 600))
+    assert tick(runner) == []
+    db.run("DELETE FROM kv")
+    scenario("ratelimited -")  # the resumed run hits the limit itself
+    assert tick(runner) == [(a, "resume")]
+    runner.wait()
+    assert state(db, a) == "failed" and it.interrupted(db, a)  # still queued to resume
+    assert tick(runner) == []  # backing off
+    db.run("DELETE FROM kv")
+    scenario("plan_ready")
+    assert drain(runner) == [(a, "resume")]
     assert state(db, a) == "plan_ready"

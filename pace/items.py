@@ -482,6 +482,20 @@ def came_from(db: DB, item_id: str, state: str) -> str | None:
     return None
 
 
+def interrupted(db: DB, item_id: str) -> bool:
+    """The item's latest state change was a restart interrupting it (§9 "On startup").
+
+    The scheduler resumes such items; anything else happening to the item
+    (Retry, back to backlog, park) clears it.
+    """
+    r = db.one("SELECT data_json FROM events WHERE item_id = ? AND kind = 'state' "
+               "ORDER BY id DESC LIMIT 1", item_id)
+    if r is None:
+        return False
+    d = json.loads(r["data_json"])
+    return d.get("to") == "failed" and bool(d.get("interrupted"))
+
+
 def failed_from(db: DB, item_id: str) -> str | None:
     """The state an item was in when it last moved to `failed` (what Retry returns to)."""
     return came_from(db, item_id, "failed")

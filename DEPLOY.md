@@ -32,6 +32,6 @@ re-clone themselves; agent worktrees and Claude sessions are recreated on demand
 
 ```sh
 sudo /opt/pace/scripts/deploy.sh          # waits until no runs are in progress
-sudo /opt/pace/scripts/deploy.sh --force  # restart now; interrupted runs can be retried
+sudo /opt/pace/scripts/deploy.sh --force  # restart now; interrupted runs resume by themselves
 journalctl -u pace -f                     # logs
 ```

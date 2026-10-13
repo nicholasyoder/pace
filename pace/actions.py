@@ -173,12 +173,17 @@ def to_backlog(r: Runner, item_id: str) -> None:
     it.transition(r.db, item_id, "backlog", "human", expect="failed")
 
 
-def retry(r: Runner, item_id: str) -> None:
-    """From failed: redo what failed — the same run kind with the same inputs."""
+def retry(r: Runner, item_id: str, *, actor: str = "human") -> None:
+    """From failed: redo what failed — the same run kind with the same inputs.
+
+    The scheduler calls this as `system` to resume runs a restart interrupted;
+    that keeps the attempt count (items.transition), so it counts toward the cap.
+    """
     frm = it.failed_from(r.db, item_id)
     _capacity(r)
+    resume = {"resume": True} if actor != "human" else {}
     if frm == "merging":
-        it.transition(r.db, item_id, "merging", "human", expect="failed")
+        it.transition(r.db, item_id, "merging", actor, expect="failed", data=resume)
         r.start_merge(item_id)
         return
     kinds = PLAN_KINDS if frm == "planning" else IMPL_KINDS if frm == "implementing" else None
@@ -188,7 +193,8 @@ def retry(r: Runner, item_id: str) -> None:
                     f"({', '.join('?' * len(kinds))}) ORDER BY id DESC LIMIT 1", item_id, *kinds)
     if last is None:
         raise ActionError("no earlier run to retry")
-    it.transition(r.db, item_id, frm, "human", expect="failed", data={"retry": last["kind"]})
+    it.transition(r.db, item_id, frm, actor, expect="failed",
+                  data={"retry": last["kind"], **resume})
     r.start(item_id, last["kind"], json.loads(last["input_json"]))
 
 
