@@ -6,7 +6,7 @@
 # The checkout in APP_DIR is deploy-only: it's reset to origin/main each time.
 # PACE develops itself by merging to origin; nothing reaches the running server
 # until this script runs. It waits until no Claude runs are in progress
-# (--force: restart anyway; interrupted runs can be retried).
+# (--force: restart anyway; interrupted runs resume after the restart).
 #
 # Needs the PACE project's deploy key at $DATA_DIR/keys/pace_ed25519 (brought
 # over by import-data.sh, or generated here on a fresh install), added to the

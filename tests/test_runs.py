@@ -8,7 +8,9 @@ import pytest
 
 from pace import actions as act
 from pace import items as it
-from pace.runs import latest_impl_output
+from pace import git as g
+from pace.runs import git_project, latest_impl_output
+from pace.scheduler import tick
 from tests.conftest import push_to_origin, sh
 
 
@@ -199,13 +201,105 @@ def test_dependencies_gate_and_context(tmp_path, db, runner, scenario, project, 
     assert "### TOY-001: Greet many" in prompt[prompt.index("-p") + 1]
 
 
+def interrupt(db, item_id, to, kind=None, inputs=None):
+    """What a restart leaves behind: the item busy, its run still `running`."""
+    it.transition(db, item_id, to, "human")
+    if kind:
+        db.run("INSERT INTO runs (item_id, kind, input_json, status, pid) "
+               "VALUES (?, ?, ?, 'running', 999999)", item_id, kind, json.dumps(inputs or {}))
+
+
+def resumes(db, item_id):
+    return [(e["actor"], json.loads(e["data_json"]).get("retry"))
+            for e in it.events(db, item_id) if e["kind"] == "state"
+            and json.loads(e["data_json"]).get("resume")]
+
+
 def test_recover_after_restart(db, runner, item):
-    it.transition(db, item, "planning", "human")
-    db.run("INSERT INTO runs (item_id, kind, status, pid) VALUES (?, 'plan', 'running', 999999)",
-           item)
+    interrupt(db, item, "planning", "plan")
     runner.recover()
-    assert state(db, item) == "failed"
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "resumes automatically" in row["last_error"]
+    assert it.interrupted(db, item)
     assert db.one("SELECT status FROM runs")["status"] == "interrupted"
+    act.to_backlog(runner, item)  # anything else happening clears the flag
+    assert not it.interrupted(db, item)
+
+
+def test_recover_without_its_run_just_fails(db, runner, item):
+    """Stopped between the transition and the run starting: Retry would redo the wrong run."""
+    interrupt(db, item, "planning", "plan")
+    db.run("UPDATE runs SET status = 'succeeded'")
+    it.transition(db, item, "needs_input", "claude")
+    interrupt(db, item, "planning")  # answers given, but no `answers` run yet
+    runner.recover()
+    row = it.item(db, item)
+    assert row["state"] == "failed" and not it.interrupted(db, item)
+    assert "resumes" not in row["last_error"]
+    assert tick(runner) == []
+
+
+def test_restart_resumes_each_kind(tmp_path, db, runner, scenario, origin, item):
+    scenario("plan_needs_input", "plan_ready", "plan_ready", "implement_done")
+    go(runner, act.plan, item)
+
+    interrupt(db, item, "planning", "answers", {"answers": "- q1_format: b"})
+    runner.recover()
+    assert tick(runner) == [(item, "resume")]
+    runner.wait()
+    assert state(db, item) == "plan_ready"
+    last = calls(tmp_path)[-1]["argv"]
+    assert "--resume" in last and "q1_format: b" in last[last.index("-p") + 1]
+
+    interrupt(db, item, "planning", "plan")
+    runner.recover()
+    tick(runner)
+    runner.wait()
+    assert state(db, item) == "plan_ready"
+
+    act.approve(runner, item)
+    interrupt(db, item, "implementing", "implement")
+    runner.recover()
+    tick(runner)
+    runner.wait()
+    assert state(db, item) == "ready_to_test"
+
+    interrupt(db, item, "merging")
+    runner.recover()
+    tick(runner)
+    runner.wait()
+    assert state(db, item) == "merged" and scenario.left() == []
+    assert resumes(db, item) == [("system", "answers"), ("system", "plan"),
+                                 ("system", "implement"), ("system", None)]
+    kinds = [k for k, s in runs(db, item) if s == "interrupted"]
+    assert kinds == ["answers", "plan", "implement"]
+
+
+def test_resumed_merge_after_its_push_landed(db, runner, scenario, origin, item):
+    scenario("plan_ready", "implement_done")
+    go(runner, act.plan, item)
+    act.approve(runner, item)
+    go(runner, act.implement, item)
+    proj = it.project(db, it.item(db, item)["project_id"])
+    msg = latest_impl_output(db, item)["commit_message"]
+    assert g.merge_local(git_project(runner.cfg, proj), item, msg).merged  # then PACE died
+    interrupt(db, item, "merging")
+    runner.recover()
+    tick(runner)
+    runner.wait()
+    assert state(db, item) == "merged"
+    assert len(sh("git", "log", "--format=%s", "main", cwd=origin).splitlines()) == 2
+
+
+def test_resume_counts_toward_the_attempt_cap(db, runner, item):
+    interrupt(db, item, "planning", "plan")
+    it.update(db, item, attempts=3)
+    runner.recover()
+    tick(runner)
+    runner.wait()
+    row = it.item(db, item)
+    assert row["state"] == "failed" and "gave up after 3 attempts in planning" in row["last_error"]
+    assert not it.interrupted(db, item)
 
 
 ROADMAP = ("Order is a suggestion.\n\n# Tier 2\nRealism.\n\n## TOY-001: Shadows\n\n"

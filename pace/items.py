@@ -481,6 +481,20 @@ def failed_from(db: DB, item_id: str) -> str | None:
     return None
 
 
+def interrupted(db: DB, item_id: str) -> bool:
+    """The item's latest state change was a restart interrupting it (§9 "On startup").
+
+    The scheduler resumes such items; anything else happening to the item
+    (Retry, back to backlog, park) clears it.
+    """
+    r = db.one("SELECT data_json FROM events WHERE item_id = ? AND kind = 'state' "
+               "ORDER BY id DESC LIMIT 1", item_id)
+    if r is None:
+        return False
+    d = json.loads(r["data_json"])
+    return d.get("to") == "failed" and bool(d.get("interrupted"))
+
+
 def unmet_dependencies(db: DB, it: sqlite3.Row, need: str) -> list[str]:
     """Dependencies not yet at `need`: 'approved' (to plan) or 'merged' (to implement)."""
     ok = {"approved", "implementing", "ready_to_test", "changes_requested", "merging",

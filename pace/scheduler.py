@@ -4,10 +4,12 @@
 implementation, then planning) run across all projects in turn, so feedback
 goes ahead of all other work. The rules that gate a single start
 (dependencies, implementation slots, the global cap) live in pace/actions.py;
-`tick` only adds ordering, `test_ahead` and `plan_ahead`.
+`tick` only adds ordering, `test_ahead` and `plan_ahead`. Before all of
+them, it resumes the runs a restart interrupted (Runner.recover), in any
+window.
 
-Outside the run windows (pace/windows.py) `tick` starts nothing; runs already
-going finish. Human actions call pace/actions.py directly, so they bypass the
+Outside the run windows (pace/windows.py) `tick` starts nothing new; runs
+already going finish (and interrupted ones resume). Human actions call pace/actions.py directly, so they bypass the
 window.
 
 `Scheduler` runs `tick` in a thread about every 10 s and whenever something is
@@ -46,6 +48,16 @@ def _try(r: Runner, started: list[tuple[str, str]], item_id: str, kind: str, fn,
     return True
 
 
+def _resume(r: Runner, p, started: list[tuple[str, str]]) -> None:
+    """Runs a restart interrupted (Runner.recover): redo them, imports included."""
+    for row in r.db.all("SELECT id FROM items WHERE project_id = ? AND state = 'failed' "
+                        "ORDER BY type DESC, position, id", p["id"]):
+        if not r.can_start():
+            return
+        if it.interrupted(r.db, row["id"]):
+            _try(r, started, row["id"], "resume", act.retry, actor="system")
+
+
 def _feedback(r: Runner, p, started: list[tuple[str, str]]) -> None:
     for row in it.items(r.db, p["id"], active_only=True):
         if not r.can_start():
@@ -76,11 +88,12 @@ def _plan(r: Runner, p, started: list[tuple[str, str]]) -> None:
 
 def tick(r: Runner, now: datetime | None = None) -> list[tuple[str, str]]:
     """Start what §9 allows right now; returns the (item, kind) pairs started."""
-    if not windows.is_open(r.cfg.run_windows, now):
-        return []
     started: list[tuple[str, str]] = []
     projects = [p for p in it.projects(r.db) if not p["paused"]]
-    for phase in (_feedback, _implement, _plan):
+    phases = [_resume]  # interrupted runs were already going: they resume outside windows too
+    if windows.is_open(r.cfg.run_windows, now):
+        phases += [_feedback, _implement, _plan]
+    for phase in phases:
         for p in projects:
             if not r.can_start():
                 return started

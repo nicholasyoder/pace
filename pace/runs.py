@@ -4,7 +4,8 @@ The caller (an action) has already moved the item into `planning`,
 `implementing` or `merging`; the runner does the git preparation, runs
 Claude, and applies the result as the next transition. Any failure moves the
 item to `failed` with the reason; Retry re-runs the same kind with the same
-inputs.
+inputs. After a restart, `recover()` queues interrupted items for the scheduler
+to retry the same way.
 
 Every run or merge start counts as an attempt in the item's current state
 (§9 rule 5); a start past MAX_ATTEMPTS is refused and fails the item. The
@@ -151,7 +152,14 @@ class Runner:
                 t.join(timeout)
 
     def recover(self) -> None:
-        """Startup: runs left `running` are interrupted, their items fail (Retry resumes)."""
+        """Startup: runs left `running` are interrupted and their items queued to resume.
+
+        An item whose interrupted run (or merge) can be redone exactly goes to
+        `failed` flagged `interrupted`; the scheduler retries it first thing
+        (§9). Otherwise (e.g. PACE stopped between the transition and the run
+        starting) it just fails, and Retry is up to me.
+        """
+        cut: set[int] = set()
         for r in self.db.all("SELECT * FROM runs WHERE status IN ('queued', 'running')"):
             if r["pid"] and _is_sudo(r["pid"]):
                 try:
@@ -160,10 +168,19 @@ class Runner:
                     pass
             self.db.run("UPDATE runs SET status = 'interrupted', ended_at = ?, "
                         "error = 'PACE restarted during the run' WHERE id = ?", now(), r["id"])
-        for row in self.db.all("SELECT id FROM items WHERE state IN "
+            cut.add(r["id"])
+        for row in self.db.all("SELECT id, state FROM items WHERE state IN "
                                "('planning', 'implementing', 'merging')"):
-            it.transition(self.db, row["id"], "failed", "system",
-                          last_error="interrupted: PACE restarted while this was in progress")
+            exact = row["state"] == "merging"
+            if not exact:
+                kinds = PLAN_KINDS if row["state"] == "planning" else IMPL_KINDS
+                last = self.db.one("SELECT id, kind FROM runs WHERE item_id = ? "
+                                   "ORDER BY id DESC LIMIT 1", row["id"])
+                exact = last is not None and last["id"] in cut and last["kind"] in kinds
+            it.transition(self.db, row["id"], "failed", "system", data={"interrupted": exact},
+                          last_error="interrupted: PACE restarted during the run; it resumes "
+                          "automatically" if exact else
+                          "interrupted: PACE restarted while this was in progress")
 
     def publish(self, item_id: str, msg: dict | None = None) -> None:
         msg = msg or {"type": "state"}
