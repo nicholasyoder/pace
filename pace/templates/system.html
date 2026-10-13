@@ -68,10 +68,10 @@
 <section>
   <h2>Usage</h2>
   <p>{% for label, n, cost in totals %}{{ label }}: ${{ '%.2f' % cost }} over {{ n }} run{{ '' if n == 1 else 's' }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
-  {% if usage %}
+  {% if run_usage %}
   <table class="runs">
     <tr><th>Run</th><th>Item</th><th>Kind</th><th>Status</th><th>Started</th><th>Cost</th><th>Tokens</th></tr>
-    {% for r, t in usage %}
+    {% for r, t in run_usage %}
     <tr><td><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
       <td>{% if r.item_id %}<a href="/i/{{ r.item_id }}">{{ r.item_id }}</a>{% endif %}</td>
       <td>{{ r.kind }}</td><td><span class="badge run-{{ r.status }}">{{ r.status }}</span></td>

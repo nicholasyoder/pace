@@ -41,6 +41,25 @@ pre.wrap { white-space: pre-wrap; word-break: break-word; }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
 .pill.running { color: var(--accent); border-color: var(--accent); }
 
+/* Claude usage indicator: a pie per window, details in a popover (§13) */
+#usage { position: relative; }
+details.usage { margin: 0; }
+details.usage > summary { list-style: none; display: flex; align-items: center; gap: 8px; font-size: .8rem;
+  font-weight: normal; color: var(--muted); border: 1px solid var(--line); border-radius: 12px; padding: 1px 8px; }
+details.usage > summary::-webkit-details-marker { display: none; }
+details.usage[open] > summary, details.usage > summary:hover { border-color: var(--muted); }
+details.usage.bad > summary { color: var(--bad); border-color: var(--bad); }
+.usage-win { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.pie { --c: var(--accent); width: 12px; height: 12px; border-radius: 50%; display: inline-block;
+  background: conic-gradient(var(--c) calc(var(--p) * 1%), var(--line) 0); box-shadow: 0 0 0 1px var(--line); }
+.pie.warn, .bar .warn { --c: var(--warn); }
+.pie.bad, .bar .bad { --c: var(--bad); }
+.usage-panel { position: absolute; right: 0; top: calc(100% + 6px); width: 280px; z-index: 2; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; font-size: .88rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .12); display: flex; flex-direction: column; gap: 8px; }
+.usage-row .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 3px 0; }
+.usage-row .bar span { --c: var(--accent); display: block; height: 100%; background: var(--c); }
+
 /* controls */
 button, .button { font: inherit; padding: 6px 14px; border-radius: var(--radius); border: 1px solid var(--line);
   background: var(--panel); color: var(--fg); cursor: pointer; display: inline-block; }
@@ -151,6 +170,7 @@ pre.small { font-size: .75rem; padding: 4px 8px; margin: 2px 0; }
   .roadmap li { flex-wrap: wrap; }
   .card-head { flex-wrap: wrap; }
   .nav { gap: 10px; }
+  .usage-panel { position: fixed; left: 12px; right: 12px; top: auto; width: auto; margin-top: 6px; }
 }
 
 /* groups & imports */

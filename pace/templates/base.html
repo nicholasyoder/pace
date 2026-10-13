@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% if inbox_count %}({{ inbox_count }}) {% endif %}{% block title %}PACE{% endblock %}</title>
-<link rel="stylesheet" href="/static/pace.css">
+<link rel="stylesheet" href="/static/pace.css?v={{ static_v }}">
 <script src="/static/htmx.min.js" defer></script>
-<script src="/static/pace.js" defer></script>
+<script src="/static/pace.js?v={{ static_v }}" defer></script>
 </head>
 <body>
 <header class="nav">
@@ -25,14 +25,7 @@
       <span class="pill bad" title="outside the run windows: the scheduler starts nothing until {{ window.next_open.strftime('%Y-%m-%d %H:%M %Z') }}; manual actions still run">paused until {{ window.next_open | clock }}</span>
     {% endif %}
   {% endif %}
-  {% if rate_limit %}
-    {% set w = rate_limit.unifiedWindows or {} %}
-    <span class="pill {% if rate_limit.status != 'allowed' %}bad{% endif %}" title="Claude usage (as of {{ rate_limit.seen_at }})">
-      {% if rate_limit.status != 'allowed' %}{{ rate_limit.status }} · {% endif %}
-      5h {{ '%d' % (((w.five_hour or {}).utilization or 0) * 100) }}% ·
-      7d {{ '%d' % (((w.seven_day or {}).utilization or 0) * 100) }}%
-    </span>
-  {% endif %}
+  <span id="usage">{% include "_usage.html" %}</span>
 </header>
 <main>
 {% if backoff %}<div class="flash" id="backoff"><strong>Rate-limit backoff:</strong> {{ backoff.reason }}. The scheduler starts no new runs until {{ backoff.until|until }}. Runs in progress finish; manual actions still work.</div>{% endif %}
