@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}System · PACE{% endblock %}
+{% block live %}<div data-sse="/events/global" hidden></div>{% endblock %}
+{% block content %}
+<h1>System</h1>
+
+<section>
+  <h2>Scheduler</h2>
+  <div class="row wrap">
+    {% if paused_all %}
+      <span class="pill bad">all paused</span>
+      <span class="muted" title="{{ paused_all.at }}">since {{ paused_all.at|age }} ago</span>
+      <form method="post" action="/system/pause" class="inline"><input type="hidden" name="on" value="0"><button class="primary">Resume</button></form>
+    {% else %}
+      <span>Running.</span>
+      <form method="post" action="/system/pause" class="inline"><input type="hidden" name="on" value="1"><button>Pause all</button></form>
+    {% endif %}
+  </div>
+  <ul>
+    <li>Run window:
+      {% if window.always %}always open
+      {% elif window.open %}open{% if window.closes_at %} until {{ window.closes_at|clock }}{% endif %}
+      {% else %}closed, opens {{ window.next_open|clock }}{% endif %}</li>
+    <li>Rate-limit backoff:
+      {% if backoff %}{{ backoff.reason }}, until {{ backoff.until|until }}{% else %}none{% endif %}</li>
+    {% if paused_projects %}
+    <li>Paused projects: {% for p in paused_projects %}<a href="/p/{{ p.slug }}/settings">{{ p.name }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</li>
+    {% endif %}
+  </ul>
+  <p class="muted">Pause all, a closed window and a backoff only stop the scheduler: runs in progress finish, and manual actions still work.</p>
+</section>
+
+<section>
+  <h2>Current runs</h2>
+  {% if current %}
+  <table class="runs">
+    <tr><th>Item</th><th>Title</th><th>Kind</th><th>Started</th><th>Run</th><th></th></tr>
+    {% for r in current %}
+    <tr><td>{% if r.item_id %}<a href="/i/{{ r.item_id }}">{{ r.item_id }}</a>{% endif %}</td>
+      <td>{{ r.title or '' }}</td><td>{{ r.kind }}</td>
+      <td title="{{ r.started_at }}">{{ r.started_at|age }} ago</td>
+      <td><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
+      <td>{% if r.item_id in busy %}<form method="post" action="/i/{{ r.item_id }}/cancel" class="inline"><input type="hidden" name="next" value="/system"><button>Stop</button></form>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="empty">Nothing running.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Recent errors</h2>
+  {% if errors %}
+  <table class="runs">
+    <tr><th>When</th><th>Item</th><th>What</th><th>Message</th></tr>
+    {% for e in errors %}
+    <tr><td title="{{ e.when }}">{{ e.when|age }} ago</td>
+      <td>{% if e.item_id %}<a href="/i/{{ e.item_id }}" title="{{ e.title or '' }}">{{ e.item_id }}</a>{% endif %}</td>
+      <td><a href="{{ e.href }}">{% if e.status %}<span class="badge run-{{ e.status }}">{{ e.what }}</span>{% else %}<span class="badge warn">{{ e.what }}</span>{% endif %}</a></td>
+      <td class="error-text">{{ (e.message or '')|truncate(200) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="empty">No recent errors.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Usage</h2>
+  <p>{% for label, n, cost in totals %}{{ label }}: ${{ '%.2f' % cost }} over {{ n }} run{{ '' if n == 1 else 's' }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% if usage %}
+  <table class="runs">
+    <tr><th>Run</th><th>Item</th><th>Kind</th><th>Status</th><th>Started</th><th>Cost</th><th>Tokens</th></tr>
+    {% for r, t in usage %}
+    <tr><td><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
+      <td>{% if r.item_id %}<a href="/i/{{ r.item_id }}">{{ r.item_id }}</a>{% endif %}</td>
+      <td>{{ r.kind }}</td><td><span class="badge run-{{ r.status }}">{{ r.status }}</span></td>
+      <td title="{{ r.started_at }}">{{ r.started_at|age }} ago</td>
+      <td>{% if r.cost_usd is not none %}${{ '%.2f' % r.cost_usd }}{% endif %}</td>
+      <td class="muted">{% for k, v in t.items() %}{{ k }} {{ '{:,}'.format(v) }}{% if not loop.last %} · {% endif %}{% endfor %}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

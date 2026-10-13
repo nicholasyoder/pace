@@ -11,7 +11,7 @@ import difflib
 import gzip
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from pace import roadmap
 from pace import windows
 from pace.roadmap import RoadmapError
 from pace.runs import activity_line, git_project, latest_impl_output, latest_plan
+from pace.scheduler import paused_all, set_paused_all
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -106,6 +107,7 @@ def render(request: Request, name: str, status: int = 200, **ctx: Any) -> HTMLRe
         "running": st.runner.active(),
         "backoff": st.runner.backoff(),
         "window": windows.status(st.cfg.run_windows),
+        "paused_all": paused_all(st.db),
         **ctx,
     }, status_code=status)
 
@@ -454,6 +456,71 @@ def run_lines(run) -> list[str]:
                         lines.append(line)
             break
     return lines
+
+
+# --- system --------------------------------------------------------------------------------
+
+RECENT = 50
+TOKENS = (("in", "input_tokens"), ("out", "output_tokens"),
+          ("cache read", "cache_read_input_tokens"), ("cache write", "cache_creation_input_tokens"))
+
+
+def tokens(usage_json: str | None) -> dict[str, int]:
+    """The token counts in a run's `usage_json`; anything missing or odd is left out."""
+    try:
+        usage = json.loads(usage_json) if usage_json else None
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(usage, dict):
+        return {}
+    return {label: usage[k] for label, k in TOKENS if isinstance(usage.get(k), int)}
+
+
+def system_context(request: Request) -> dict[str, Any]:
+    st = request.app.state
+    db = st.db
+    run_cols = ("SELECT runs.*, items.title, projects.slug AS project_slug FROM runs "
+                "LEFT JOIN items ON items.id = runs.item_id "
+                "LEFT JOIN projects ON projects.id = items.project_id ")
+    current = db.all(run_cols + "WHERE runs.status IN ('queued', 'running') ORDER BY runs.id")
+    errors = [dict(when=r["ended_at"] or r["started_at"], item_id=r["item_id"], title=r["title"],
+                   what=f"{r['kind']} {r['status']}", status=r["status"], message=r["error"],
+                   href=f"/runs/{r['id']}")
+              for r in db.all(run_cols + "WHERE runs.status IN ('failed', 'interrupted', "
+                              "'rate_limited') ORDER BY runs.id DESC LIMIT ?", RECENT)]
+    for e in db.all("SELECT events.*, items.title FROM events LEFT JOIN items ON "
+                    "items.id = events.item_id WHERE events.kind IN ('readonly_violation', "
+                    "'dirty_worktree') ORDER BY events.id DESC LIMIT ?", RECENT):
+        errors.append(dict(when=e["ts"], item_id=e["item_id"], title=e["title"], what=e["kind"],
+                           status=None, message=(fromjson(e["data_json"]) or {}).get("message"),
+                           href=f"/i/{e['item_id']}"))
+    errors.sort(key=lambda x: x["when"] or "", reverse=True)
+    usage = [(r, tokens(r["usage_json"])) for r in
+             db.all(run_cols + "ORDER BY runs.id DESC LIMIT ?", RECENT)]
+    totals = []
+    for label, since in (("24 h", timedelta(days=1)), ("7 days", timedelta(days=7)),
+                         ("all time", None)):
+        cutoff = (datetime.now(UTC) - since).isoformat(timespec="seconds") if since else ""
+        row = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost FROM runs "
+                     "WHERE COALESCE(started_at, '') >= ?", cutoff)
+        totals.append((label, row["n"], row["cost"]))
+    return dict(current=current, busy={r["item_id"] for r in current
+                                       if r["item_id"] and st.runner.busy(r["item_id"])},
+                errors=errors[:RECENT], usage=usage, totals=totals,
+                paused_projects=[p for p in it.projects(db) if p["paused"]])
+
+
+@router.get("/system", response_class=HTMLResponse)
+def system_page(request: Request):
+    return render(request, "system.html", **system_context(request))
+
+
+@router.post("/system/pause")
+async def system_pause(request: Request):
+    form = await request.form()
+    set_paused_all(db_(request), form.get("on") == "1")
+    request.app.state.runner.publish("-")  # e.g. resumed: wake the scheduler
+    return back("/system")
 
 
 # --- SSE ----------------------------------------------------------------------------------

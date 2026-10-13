@@ -14,8 +14,10 @@
   <a href="/" class="inbox-link">Inbox{% if inbox_count %} <span class="count">{{ inbox_count }}</span>{% endif %}</a>
   {% for p in all_projects %}<a href="/p/{{ p.slug }}">{{ p.name }}{% if p.paused %} ⏸{% endif %}</a>{% endfor %}
   <a href="/projects/new" class="muted">+ project</a>
+  <a href="/system">System</a>
   <span class="spacer"></span>
   {% if running %}<span class="pill running" title="runs in progress">{{ running }} running</span>{% endif %}
+  {% if paused_all %}<a href="/system" class="pill bad" title="pause all: the scheduler starts nothing; runs in progress finish and manual actions still run">all paused</a>{% endif %}
   {% if not window.always %}
     {% if window.open %}
       <span class="pill" title="run window open{% if window.closes_at %} until {{ window.closes_at.strftime('%Y-%m-%d %H:%M %Z') }}{% endif %}">window{% if window.closes_at %} until {{ window.closes_at | clock }}{% endif %}</span>
