@@ -4,8 +4,9 @@ The caller (an action) has already moved the item into `planning`,
 `implementing` or `merging`; the runner does the git preparation, runs
 Claude, and applies the result as the next transition. Any failure moves the
 item to `failed` with the reason; Retry re-runs the same kind with the same
-inputs. After a restart, `recover()` queues interrupted items for the scheduler
-to retry the same way.
+inputs. A run that hits a rate limit instead sends the item back to where it
+came from and starts a backoff (§8.1, `backoff()`). After a restart,
+`recover()` queues interrupted items for the scheduler to retry the same way.
 
 Every run or merge start counts as an attempt in the item's current state
 (§9 rule 5); a start past MAX_ATTEMPTS is refused and fails the item. The
@@ -21,7 +22,10 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 import traceback
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +41,7 @@ from pace.roadmap import RoadmapError, format_id
 PLAN_KINDS = ("plan", "import", "answers", "revise_plan")
 IMPL_KINDS = ("implement", "address_feedback", "resolve_conflicts")
 MAX_ATTEMPTS = 3
+RATE_LIMIT_FALLBACK = 30 * 60  # backoff when no resetsAt is known (seconds)
 
 
 class RunFailed(RuntimeError):
@@ -80,6 +85,58 @@ def is_rate_limited(r: RunResult) -> bool:
         return True
     text = (str((r.result_event or {}).get("result", "")) + r.stderr).lower()
     return not r.ok and any(s in text for s in ("rate limit", "usage limit", "rate_limit"))
+
+
+@dataclass(frozen=True)
+class Backoff:
+    reason: str
+    until: float  # epoch seconds
+
+
+def _num(x: Any) -> float | None:
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _epoch(ts: Any) -> float | None:
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts).timestamp()
+        except ValueError:
+            return None
+    return _num(ts)
+
+
+def backoff(info: Any, hit: Any, threshold: float, now_ts: float) -> Backoff | None:
+    """Whether the scheduler must hold off, and until when (§8.1).
+
+    `info` is the latest rate_limit_info (kv `rate_limit`), `hit` the last run
+    that failed on a limit (kv `rate_limit_hit`). Parsing is loose: the shape
+    is only partly known. Of the reasons that still apply, the one ending
+    last wins; ones already past are ignored, so stale data clears itself.
+    """
+    found: list[Backoff] = []
+    if isinstance(info, dict):
+        resets = _num(info.get("resetsAt"))
+        status = info.get("status")
+        if status not in (None, "allowed"):
+            seen = _epoch(info.get("seen_at"))
+            until = resets or (seen + RATE_LIMIT_FALLBACK if seen else None)
+            if until:
+                found.append(Backoff(f"Claude reports usage status “{status}”", until))
+        wins = info.get("unifiedWindows")
+        for key, label in (("five_hour", "5-hour"), ("seven_day", "7-day")):
+            w = wins.get(key) if isinstance(wins, dict) else None
+            u = _num(w.get("utilization")) if isinstance(w, dict) else None
+            if u is not None and u >= threshold:
+                until = _num(w.get("resetsAt")) or resets  # type: ignore[union-attr]
+                if until:
+                    found.append(Backoff(f"{label} usage at {u:.0%} (threshold {threshold:.0%})",
+                                         until))
+    if isinstance(hit, dict) and (at := _num(hit.get("at"))):
+        found.append(Backoff(f"a run of {hit.get('item') or 'an item'} hit a rate limit",
+                             at + RATE_LIMIT_FALLBACK))
+    found = [b for b in found if b.until > now_ts]
+    return max(found, key=lambda b: b.until) if found else None
 
 
 def resume_failed(r: RunResult) -> bool:
@@ -126,6 +183,11 @@ class Runner:
 
     def can_start(self) -> bool:
         return self.active() < self.cfg.concurrency
+
+    def backoff(self) -> Backoff | None:
+        """The rate-limit backoff in force right now, if any (§8.1)."""
+        return backoff(self.db.kv_get("rate_limit"), self.db.kv_get("rate_limit_hit"),
+                       self.cfg.rate_limit_threshold, time.time())
 
     def start(self, item_id: str, kind: str, inputs: dict | None = None) -> None:
         self._spawn(item_id, lambda: self._run(item_id, kind, inputs or {}))
@@ -208,7 +270,10 @@ class Runner:
                 detail += "\n" + traceback.format_exc(limit=5)
             try:
                 if it.item(self.db, item_id)["state"] in it.BUSY:
-                    it.transition(self.db, item_id, "failed", "system", last_error=detail)
+                    if isinstance(e, RunFailed) and e.status == "rate_limited":
+                        self._rate_limited(item_id, detail)
+                    else:
+                        it.transition(self.db, item_id, "failed", "system", last_error=detail)
             except Exception:
                 traceback.print_exc()
         finally:
@@ -216,6 +281,31 @@ class Runner:
                 self._threads.pop(item_id, None)
                 self._procs.pop(item_id, None)
             self.publish(item_id)
+
+    def _rate_limited(self, item_id: str, detail: str) -> None:
+        """Back off, and send the item back to where it was before the run (§8.1).
+
+        The scheduler picks backlog / approved / changes_requested up again once
+        the backoff ends; answers, revise-plan and merge wait for the human. A
+        Retry from `failed` (or anything unexpected) stays `failed`, except that
+        an automatic resume after a restart stays flagged to resume.
+        """
+        self.db.kv_set("rate_limit_hit", {"at": time.time(), "item": item_id,
+                                          "error": detail[:500]})
+        cur = it.item(self.db, item_id)["state"]
+        frm = it.came_from(self.db, item_id, cur)
+        to = "ready_to_test" if frm == "merging" else frm
+        if to is None or to == "failed" or to not in it.ALLOWED[cur]:
+            # a resume after a restart stays queued: it goes again after the backoff
+            last = self.db.one("SELECT data_json FROM events WHERE item_id = ? AND kind = "
+                               "'state' ORDER BY id DESC LIMIT 1", item_id)
+            resume = last is not None and bool(json.loads(last["data_json"]).get("resume"))
+            it.transition(self.db, item_id, "failed", "system", data={"interrupted": resume},
+                          last_error=f"rate limited; resumes after the backoff ({detail})"
+                          if resume else detail)
+            return
+        it.transition(self.db, item_id, to, "system", data={"rate_limited": True},
+                      last_error=f"rate limited; back in {to} until the limit resets ({detail})")
 
     def _transition(self, item_id: str, to: str, actor: str = "system", **kw: Any) -> None:
         it.transition(self.db, item_id, to, actor, **kw)

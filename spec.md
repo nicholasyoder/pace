@@ -78,7 +78,7 @@ scripts/setup-vm.sh scripts/agent-CLAUDE.md
 
 ## 5. Configuration
 
-**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (`HH:MM-HH:MM`, server local time, §9), per-run timeout. It holds no secrets: git push uses per-project deploy keys (or `pace`'s own SSH setup) and PRs use `pace`'s `gh auth`.
+**Global `config.toml`:** data dir, bind address, agent user name, ntfy URL, global concurrency cap, run windows (`HH:MM-HH:MM`, server local time, §9), rate-limit threshold (`rate_limit_threshold`, default 0.9, §8.1), per-run timeout. It holds no secrets: git push uses per-project deploy keys (or `pace`'s own SSH setup) and PRs use `pace`'s `gh auth`.
 
 **Project settings** (stored in the DB, edited with a UI form):
 
@@ -143,11 +143,11 @@ headings inside it must be `###` or deeper.
 | State | Meaning | What moves it on |
 |---|---|---|
 | `backlog` | Not started | Scheduler |
-| `planning` | A `plan` / `revise_plan` run is in progress | Run completion |
+| `planning` | A `plan` / `revise_plan` run is in progress | Run completion (a rate-limited run goes back to where it came from, §8.1) |
 | `needs_input` | Claude has questions | **Me**: answer → `planning` |
 | `plan_ready` | Plan awaiting approval | **Me**: approve → `approved`; feedback → `planning`; park → `parked` |
 | `approved` | Waiting for an implementation slot | Scheduler |
-| `implementing` | An `implement` / `address_feedback` / `resolve_conflicts` run is in progress | Run completion |
+| `implementing` | An `implement` / `address_feedback` / `resolve_conflicts` run is in progress | Run completion (a rate-limited run goes back to where it came from, §8.1) |
 | `ready_to_test` | Branch pushed (and PR open in PR mode) | **Me**: "Works → merge" → `merging`; "Problem…" + note → `changes_requested` |
 | `changes_requested` | I reported a problem | Scheduler (goes ahead of other work) |
 | `merging` | Merge in progress | Deterministic; conflicts → `resolve_conflicts` run |
@@ -186,7 +186,9 @@ sudo -n -u pace-agent -H -D <worktree> ~pace-agent/.local/bin/claude \
 - **Stream events** are written to a gzipped log and sent over SSE to the item's live activity pane.
 - **Sessions:** the first run stores its `session_id`, and every later run on the item resumes that session in the same worktree path. If resume fails, start a fresh session and put the plan, the Q&A history and the feedback into the prompt.
 - **Invalid or missing structured output** gets one automatic retry that says what was wrong. After that the item goes to `failed`.
-- **Rate limits / quota:** every run emits `rate_limit_event`s whose `rate_limit_info` has `status` (`allowed` normally), `resetsAt`, and `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`. PACE stores the latest one. The scheduler stops starting runs while utilization is above a configured threshold, or while `status` isn't `allowed`, until `resetsAt`, and the UI shows a banner. A run that fails on a limit anyway is marked `rate_limited` and the item returns to its prior state. The exact failure shape is still unseen, so detect it loosely.
+- **Rate limits / quota:** every run emits `rate_limit_event`s whose `rate_limit_info` has `status` (`allowed` normally), `resetsAt`, and `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`. PACE stores the latest one (kv `rate_limit`) and shows it as a pill.
+  - **Backoff:** the scheduler starts no runs while (a) `status` isn't `allowed`, until `resetsAt` (or 30 min after it was seen if there is none); (b) either window's `utilization` is at or above `rate_limit_threshold` (config, default 0.9), until that window's `resetsAt` (else the top-level one); or (c) a run failed on a limit in the last 30 min (kv `rate_limit_hit`). The latest end time wins. Reasons whose end time has passed are ignored, so old data clears itself even though only a new run brings a fresh event. Every page shows a banner with the reason and when the backoff ends. Runs in progress finish, and manual actions (Plan now, Implement, answers, revise-plan, Retry, merge) are not blocked.
+  - **A run that fails on a limit anyway** is marked `rate_limited` and the item returns to the state it was in before the run: `plan`/`import` → `backlog`, `implement` → `approved`, `address_feedback` → `changes_requested`, `answers` → `needs_input`, `revise_plan` → `plan_ready`/`approved`, `resolve_conflicts` → `ready_to_test`. The scheduler picks up the first three after the backoff; the others wait for me to answer, revise or merge again. A rate-limited Retry stays `failed`; a rate-limited automatic resume after a restart (§9 "On startup") stays `failed` but still flagged, so it resumes after the backoff. The exact failure shape is still unseen, so detection is loose: a non-`allowed` status, or "rate limit" / "usage limit" in the output of a failed run.
 - Every run has a hard timeout. Timeouts and **Stop run** send SIGTERM to sudo, which relays it to `claude`, which kills its tool processes and exits (verified in M1). SIGKILL comes only after a 15 s grace period, because it would kill just sudo and orphan `claude` under the agent user, where PACE can't signal it.
 - `--model` doesn't apply to plan mode: with `--model haiku`, plan runs still reported Sonnet usage.
 - **Retry** re-runs the failed run's kind with the same inputs (stored in `runs.input_json`). A failed merge retries the merge.
@@ -232,7 +234,7 @@ Templates live in `prompts/*.md` with `{{variables}}`: `plan`, `answers`, `revis
 
 ## 9. Scheduler
 
-A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** and outside rate-limit backoff (§8.1). Runs already in progress always finish.
+A loop runs every ~10 s and on every state change. It only starts runs inside a **run window** and outside rate-limit backoff (§8.1: status not `allowed`, usage at or above `rate_limit_threshold`, or a recent rate-limited run, until the reset). Runs already in progress always finish.
 
 **Run windows:** `run_windows = ["22:00-08:00"]` in `config.toml`; empty or absent means always. Each window is `HH:MM-HH:MM` in the server's local time (the VM timezone, or `TZ` in the systemd unit); the start is inclusive and the end exclusive, an end earlier than the start spans midnight, `24:00` is allowed as an end, and a window can't start and end at the same time. Several windows combine: any open one is enough. A malformed window stops the server at startup. Outside the windows the scheduler starts nothing new (interrupted runs still resume, see "On startup"); an opening window is picked up by the next tick. **Explicit human starts bypass the window:** Plan now, Implement now, Start fix now, answers, revise-plan, Retry, Works → merge (and the conflict resolution it may start) and import all run straight away. Approve and Problem only queue work, so the `implement` / `address_feedback` after them waits for the window. The nav and the System page show "window until HH:MM" or "paused until HH:MM".
 
@@ -246,7 +248,7 @@ Each tick runs the steps across all unpaused projects in turn (feedback in every
 
 **On startup:** any run still marked `running` becomes `interrupted`, its sudo PID gets SIGTERM if still alive, and the item is re-queued to resume its session:
 - Every item left in `planning` / `implementing` / `merging` moves to `failed` ("interrupted: PACE restarted during the run; it resumes automatically"), with its state event flagged `interrupted`.
-- Before steps 1–3, each tick resumes flagged items: an automatic Retry as `system`, which re-runs the interrupted run's kind with the same `input_json` (resuming the item's session; `implement` restarts from the base), or retries the merge. A retried merge whose push had already landed finds the branch in the base and doesn't commit again. Resumes take a slot under the global cap, go ahead of all other work, ignore `plan_ahead` / `test_ahead` / implementation slots (that work was already counted), run outside the run windows (it was already in progress), and also cover imports. Paused projects keep them until unpaused.
+- Before steps 1–3, each tick resumes flagged items: an automatic Retry as `system`, which re-runs the interrupted run's kind with the same `input_json` (resuming the item's session; `implement` restarts from the base), or retries the merge. A retried merge whose push had already landed finds the branch in the base and doesn't commit again. Resumes take a slot under the global cap, go ahead of all other work, ignore `plan_ahead` / `test_ahead` / implementation slots (that work was already counted), run outside the run windows (it was already in progress) but not during a rate-limit backoff, and also cover imports. Paused projects keep them until unpaused.
 - Resumes count toward the attempt cap (rule 5).
 - Any other change to the item (Retry, back to backlog, park) clears the flag.
 - If the item's latest run isn't the one that was interrupted (PACE stopped between the transition and the run starting), it just fails with "interrupted: PACE restarted while this was in progress", and Retry is up to me.

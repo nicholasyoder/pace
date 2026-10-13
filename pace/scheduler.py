@@ -8,9 +8,10 @@ goes ahead of all other work. The rules that gate a single start
 them, it resumes the runs a restart interrupted (Runner.recover), in any
 window.
 
-Outside the run windows (pace/windows.py) `tick` starts nothing new; runs
-already going finish (and interrupted ones resume). Human actions call pace/actions.py directly, so they bypass the
-window.
+Outside the run windows (pace/windows.py) and during a rate-limit backoff
+(`Runner.backoff`, §8.1) `tick` starts nothing new; runs already going finish.
+Interrupted runs resume outside the windows too, but not during a backoff.
+Human actions call pace/actions.py directly, so they bypass both.
 
 `Scheduler` runs `tick` in a thread about every 10 s and whenever something is
 published on the bus's `global` topic (every state change).
@@ -86,8 +87,28 @@ def _plan(r: Runner, p, started: list[tuple[str, str]]) -> None:
                 ahead += 1
 
 
+_last_backoff: str | None = None
+
+
+def _in_backoff(r: Runner) -> bool:
+    """Log when a backoff starts or ends, not on every tick."""
+    global _last_backoff
+    b = r.backoff()
+    reason = b.reason if b else None
+    if reason != _last_backoff:
+        if b:
+            log.info("rate-limit backoff: %s; starting nothing until %s", b.reason,
+                     datetime.fromtimestamp(b.until).astimezone().strftime("%a %H:%M %Z"))
+        else:
+            log.info("rate-limit backoff over")
+        _last_backoff = reason
+    return b is not None
+
+
 def tick(r: Runner, now: datetime | None = None) -> list[tuple[str, str]]:
     """Start what §9 allows right now; returns the (item, kind) pairs started."""
+    if _in_backoff(r):
+        return []
     started: list[tuple[str, str]] = []
     projects = [p for p in it.projects(r.db) if not p["paused"]]
     phases = [_resume]  # interrupted runs were already going: they resume outside windows too

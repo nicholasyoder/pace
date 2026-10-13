@@ -33,6 +33,7 @@
   {% endif %}
 </header>
 <main>
+{% if backoff %}<div class="flash" id="backoff"><strong>Rate-limit backoff:</strong> {{ backoff.reason }}. The scheduler starts no new runs until {{ backoff.until|until }}. Runs in progress finish; manual actions still work.</div>{% endif %}
 <div id="stale" class="flash" hidden>This page has changed. <a href="">Reload</a></div>
 {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
 {% block content %}{% endblock %}

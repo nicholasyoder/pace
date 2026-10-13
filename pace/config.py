@@ -24,6 +24,7 @@ class Config:
     run_timeout_minutes: int = 60
     concurrency: int = 2
     run_windows: list[str] = field(default_factory=list)
+    rate_limit_threshold: float = 0.9  # back off at this 5h / 7d utilization (§8.1)
     ntfy_url: str = ""
 
     @property
@@ -45,6 +46,11 @@ def load(path: Path | None = None) -> Config:
     for k in ("data_dir", "agent_home"):
         if k in raw:
             raw[k] = Path(raw[k])
+    if "rate_limit_threshold" in raw:
+        t = raw["rate_limit_threshold"]
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= 1:
+            raise ValueError(f"{path}: rate_limit_threshold must be a number in (0, 1]")
+        raw["rate_limit_threshold"] = float(t)
     if "run_windows" in raw:
         rw = raw["run_windows"]
         if not isinstance(rw, list) or not all(isinstance(w, str) for w in rw):

@@ -77,8 +77,20 @@ def clock(t: datetime | None) -> str:
     return t.strftime("%H:%M" if t.date() == windows.local_now().date() else "%a %H:%M")
 
 
+def until(ts: float) -> str:
+    """An epoch time ahead: `Sat 14:30 UTC (in 2h 5m)`."""
+    t = datetime.fromtimestamp(ts).astimezone()
+    secs = int(ts - datetime.now(UTC).timestamp())
+    left = []
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n and len(left) < 2:
+            left.append(f"{secs // n}{unit}")
+            secs %= n
+    return f"{t.strftime('%a %H:%M %Z')} (in {' '.join(left) or '<1m'})"
+
+
 templates.env.filters.update(md=md, mdi=md_inline, diff=diff_html, age=age, fromjson=fromjson,
-                             clock=clock)
+                             clock=clock, until=until)
 
 INBOX_GROUPS = [("needs_input", "Questions"), ("plan_ready", "Plans to approve"),
                 ("ready_to_test", "Ready to test"), ("failed", "Problems")]
@@ -92,6 +104,7 @@ def render(request: Request, name: str, status: int = 200, **ctx: Any) -> HTMLRe
         "all_projects": it.projects(st.db),
         "rate_limit": st.db.kv_get("rate_limit"),
         "running": st.runner.active(),
+        "backoff": st.runner.backoff(),
         "window": windows.status(st.cfg.run_windows),
         **ctx,
     }, status_code=status)
