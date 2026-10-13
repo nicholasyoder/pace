@@ -101,7 +101,7 @@ def render(request: Request, name: str, status: int = 200, **ctx: Any) -> HTMLRe
     st = request.app.state
     ctx.setdefault("error", None)
     return templates.TemplateResponse(request, name, {
-        "inbox_count": len(it.inbox(st.db)),
+        "inbox_count": len(it.inbox(st.db)) + len(it.open_proposals(st.db)),
         "all_projects": it.projects(st.db),
         "rate_limit": st.db.kv_get("rate_limit"),
         "running": st.runner.active(),
@@ -138,6 +138,10 @@ def get_project(request: Request, slug: str):
 
 @router.get("/", response_class=HTMLResponse)
 def inbox(request: Request, project: str | None = None):
+    return inbox_page(request, project)
+
+
+def inbox_page(request: Request, project: str | None, status: int = 200, error=None):
     db = db_(request)
     pid = get_project(request, project)["id"] if project else None
     rows = it.inbox(db, pid)
@@ -145,7 +149,39 @@ def inbox(request: Request, project: str | None = None):
     busy = db.all("SELECT items.*, projects.slug AS project_slug FROM items JOIN projects ON "
                   "projects.id = project_id WHERE state IN ('planning', 'implementing', "
                   "'merging') ORDER BY state_since")
-    return render(request, "inbox.html", groups=groups, busy=busy, project_filter=project)
+    proposals = it.open_proposals(db, pid)
+    targets = {p: (it.groups(db, p), it.default_group(db, p))
+               for p in {r["project_id"] for r in proposals}}
+    return render(request, "inbox.html", status, groups=groups, busy=busy, proposals=proposals,
+                  targets=targets, project_filter=project, error=error)
+
+
+def get_proposal(request: Request, proposal_id: int):
+    row = db_(request).one("SELECT * FROM proposals WHERE id = ?", proposal_id)
+    if row is None:
+        raise HTTPException(404, f"no proposal {proposal_id}")
+    return row
+
+
+@router.post("/proposals/{proposal_id}/{action}")
+async def proposal_action(request: Request, proposal_id: int, action: str):
+    """Accept (add to the roadmap, in the chosen group) or dismiss a proposed item (§6)."""
+    get_proposal(request, proposal_id)
+    form = await request.form()
+    nxt = str(form.get("next") or "/")
+    try:
+        if action == "accept":
+            gid = str(form.get("group_id", ""))
+            it.accept_proposal(db_(request), proposal_id, int(gid) if gid else None)
+        elif action == "dismiss":
+            it.dismiss_proposal(db_(request), proposal_id)
+        else:
+            raise HTTPException(404, f"no action {action}")
+    except ValueError as e:
+        project = str(form.get("project") or "") or None
+        return inbox_page(request, project, 409, error=str(e))
+    request.app.state.runner.publish("-")
+    return back(nxt)
 
 
 # --- projects --------------------------------------------------------------------------
@@ -218,8 +254,8 @@ def project_page(request: Request, slug: str, show: str = "active"):
              for r in rows if r["state"] in ("backlog", "approved")}
     key = deploy_key(request, p)
     return render(request, "project.html", project=p, rows=rows, show=show, unmet=unmet,
-                  groups=it.groups(db, p["id"]), imports=it.imports(db, p["id"]),
-                  needs_key=bool(key and not (key["access"] or {}).get("ok")))
+                  groups=it.groups(db, p["id"]), default_group=it.default_group(db, p["id"]),
+                  imports=it.imports(db, p["id"]), needs_key=bool(key and not (key["access"] or {}).get("ok")))
 
 
 @router.post("/p/{slug}/import")
@@ -233,6 +269,7 @@ async def project_import(request: Request, slug: str):
         return render(request, "project.html", 409, project=p, show="active", unmet={},
                       rows=it.items(db_(request), p["id"], active_only=True),
                       groups=it.groups(db_(request), p["id"]),
+                      default_group=it.default_group(db_(request), p["id"]),
                       imports=it.imports(db_(request), p["id"]), error=str(e))
     return back(f"/i/{item_id}")
 
@@ -250,6 +287,7 @@ async def quick_add(request: Request, slug: str):
         return render(request, "project.html", 400, project=p, show="active", unmet={},
                       rows=it.items(db_(request), p["id"], active_only=True),
                       groups=it.groups(db_(request), p["id"]),
+                      default_group=it.default_group(db_(request), p["id"]),
                       imports=it.imports(db_(request), p["id"]), error=str(e))
     request.app.state.runner.publish("-")
     return back(f"/p/{slug}")
@@ -360,7 +398,8 @@ def item_context(request: Request, item_id: str) -> dict[str, Any]:
                 ("backlog", "approved") else [],
                 busy=st.runner.busy(item_id), branch=g.branch_name(item_id),
                 total_cost=sum(r["cost_usd"] or 0 for r in runs),
-                proposals=db.all("SELECT * FROM proposals WHERE source_item_id = ?", item_id))
+                proposals=db.all("SELECT * FROM proposals WHERE source_item_id = ? ORDER BY id",
+                                 item_id))
 
 
 @router.get("/i/{item_id}", response_class=HTMLResponse)

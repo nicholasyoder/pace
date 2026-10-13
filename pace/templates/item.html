@@ -219,7 +219,7 @@
 {% if proposals %}
 <section class="panel">
   <h2>Proposed items</h2>
-  <ul>{% for p in proposals %}<li><strong>{{ p.title }}</strong> <span class="muted">({{ p.status }})</span>: {{ p.reason }}</li>{% endfor %}</ul>
+  <ul>{% for p in proposals %}<li><strong>{{ p.title }}</strong> <span class="muted">({% if p.item_id %}accepted as <a href="/i/{{ p.item_id }}">{{ p.item_id }}</a>{% elif p.status == 'open' %}<a href="/">in the inbox</a>{% else %}{{ p.status }}{% endif %})</span>: {{ p.reason }}</li>{% endfor %}</ul>
 </section>
 {% endif %}
 

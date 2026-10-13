@@ -86,6 +86,8 @@ section { margin: 18px 0; }
   padding: 10px 12px; margin: 8px 0; color: var(--fg); }
 .card:hover { border-color: var(--accent); text-decoration: none; }
 .card.quiet { padding: 6px 12px; }
+.card.proposal:hover { border-color: var(--line); }
+.card.proposal .quick-add { margin: 8px 0 0; }
 .card-head { display: flex; align-items: baseline; gap: 8px; }
 .card-head .title { font-weight: 600; }
 .card-body { margin-top: 4px; color: var(--muted); }

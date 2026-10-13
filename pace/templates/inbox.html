@@ -36,6 +36,38 @@
     {% endfor %}
   </section>
 {% endfor %}
+{% if proposals %}
+  {% set ns.any = true %}
+  <section>
+    <h2>Proposed items <span class="muted">{{ proposals|length }}</span></h2>
+    {% for p in proposals %}
+    {% set gs, default = targets[p.project_id] %}
+    <div class="card proposal">
+      <div class="card-head">
+        {% if all_projects|length > 1 %}<span class="id">{{ p.project_slug }}</span>{% endif %}
+        <span class="title">{{ p.title }}</span>
+        <span class="spacer"></span>
+        {% if p.source_item_id %}<span class="muted">from <a href="/i/{{ p.source_item_id }}">{{ p.source_item_id }}</a></span>{% endif %}
+        <span class="muted" title="{{ p.created_at or '' }}">{{ p.created_at|age }}</span>
+      </div>
+      {% if p.reason %}<div class="card-body">{{ p.reason }}</div>{% endif %}
+      {% if p.description %}<details class="card-body"><summary>Description</summary>{{ p.description|md }}</details>{% endif %}
+      <form method="post" action="/proposals/{{ p.id }}/accept" class="quick-add">
+        <input type="hidden" name="next" value="/{% if project_filter %}?project={{ project_filter }}{% endif %}">
+        <input type="hidden" name="project" value="{{ project_filter or '' }}">
+        {% if gs %}
+        <select name="group_id" title="group" class="group-select">
+          <option value="">(ungrouped)</option>
+          {% for g in gs %}<option value="{{ g.id }}" {% if g.id == default %}selected{% endif %}>{{ g.title }}</option>{% endfor %}
+        </select>
+        {% endif %}
+        <button class="primary small">Accept</button>
+        <button class="small" formaction="/proposals/{{ p.id }}/dismiss">Dismiss</button>
+      </form>
+    </div>
+    {% endfor %}
+  </section>
+{% endif %}
 {% if not ns.any %}
   <p class="empty">Nothing needs you right now.</p>
 {% endif %}
