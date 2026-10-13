@@ -8,7 +8,7 @@ import pytest
 
 from pace import actions as act
 from pace import items as it
-from pace.runs import RATE_LIMIT_FALLBACK, backoff
+from pace.runs import RATE_LIMIT_FALLBACK, backoff, usage_sig, usage_view
 from pace.scheduler import Scheduler, paused_all, set_paused_all, tick
 
 
@@ -344,3 +344,33 @@ def test_resume_waits_out_a_backoff(db, runner, cfg, scenario, project):
     scenario("plan_ready")
     assert drain(runner) == [(a, "resume")]
     assert state(db, a) == "plan_ready"
+
+
+def test_usage_view():
+    assert usage_view(None, 0.9, NOW) is None and usage_view("x", 0.9, NOW) is None
+    u = usage_view(info(five=(0.34, NOW + 100), seven=(0.8, NOW + 9000), seen_at="t"), 0.9, NOW)
+    assert u.allowed and u.seen_at == "t" and u.threshold == 0.9
+    five, seven = u.windows
+    assert (five.short, five.utilization, five.resets_at, five.reset, five.level) == \
+        ("5h", 0.34, NOW + 100, False, "ok")
+    assert (seven.label, seven.level) == ("7-day", "warn")  # ≥ 75% of the threshold
+    u = usage_view(info(five=(0.95, NOW - 1), seven=(0.9, NOW + 5)), 0.9, NOW)
+    assert (u.windows[0].utilization, u.windows[0].reset, u.windows[0].level) == (0, True, "ok")
+    assert u.windows[1].level == "bad"
+    u = usage_view(info("rejected", NOW + 60), 0.9, NOW)
+    assert not u.allowed and u.status == "rejected" and u.windows == [] and u.resets_at == NOW + 60
+    for junk in ({}, {"status": None, "unifiedWindows": "?"},
+                 {"unifiedWindows": {"five_hour": {"utilization": "hi"}}}):
+        assert usage_view(junk, 0.9, NOW) is None
+    u = usage_view({"status": "allowed", "unifiedWindows": {"seven_day": {"utilization": 3}}}, 0.9,
+                   NOW)
+    assert [(w.short, w.utilization, w.resets_at) for w in u.windows] == [("7d", 1.0, None)]
+
+
+def test_usage_sig():
+    a = info(five=(0.341, NOW + 100), seven=(0.5, NOW + 9000))
+    assert usage_sig(a) == usage_sig(info(five=(0.338, NOW + 100), seven=(0.5, NOW + 9000)))
+    assert usage_sig(a) != usage_sig(info(five=(0.36, NOW + 100), seven=(0.5, NOW + 9000)))
+    assert usage_sig(a) != usage_sig(info(five=(0.34, NOW + 200), seven=(0.5, NOW + 9000)))
+    assert usage_sig(a) != usage_sig(info("rejected", five=(0.34, NOW + 100), seven=(0.5, NOW + 9000)))
+    assert usage_sig(None) == ()

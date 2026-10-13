@@ -1,0 +1,30 @@
+{% if usage %}
+<details class="usage{% if not usage.allowed %} bad{% endif %}">
+  <summary aria-label="Claude usage{% for w in usage.windows %}: {{ w.label }} {{ '%d' % (w.utilization * 100) }}%{% endfor %}">
+    {% if not usage.allowed %}<span class="usage-status">{{ usage.status }}</span>{% endif %}
+    {% for w in usage.windows %}
+    <span class="usage-win"><span class="pie {{ w.level }}" style="--p: {{ '%d' % (w.utilization * 100) }}"></span>{{ w.short }} {{ '%d' % (w.utilization * 100) }}%</span>
+    {% endfor %}
+  </summary>
+  <div class="usage-panel">
+    <strong>Claude usage</strong>
+    {% for w in usage.windows %}
+    <div class="usage-row">
+      <div class="row"><span>{{ w.label }}</span><span class="spacer"></span><span>{{ '%d' % (w.utilization * 100) }}% used</span></div>
+      <div class="bar"><span class="{{ w.level }}" style="width: {{ '%d' % (w.utilization * 100) }}%"></span></div>
+      <div class="muted small">
+        {% if w.reset %}reset since this was seen; no newer data until the next run
+        {% elif w.resets_at %}resets {{ w.resets_at|until }}
+        {% else %}reset time unknown{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+    <div class="small">
+      Status: <span class="{% if not usage.allowed %}error-text{% endif %}">{{ usage.status or 'unknown' }}</span>{% if not usage.allowed and usage.resets_at %}, until {{ usage.resets_at|until }}{% endif %}<br>
+      The scheduler backs off at {{ '%d' % (usage.threshold * 100) }}%.<br>
+      {% if usage.seen_at %}<span class="muted" title="{{ usage.seen_at }}">As of {{ usage.seen_at|age }} ago; Claude reports usage only during runs.</span><br>{% endif %}
+      <a href="/system">Costs and tokens →</a>
+    </div>
+  </div>
+</details>
+{% endif %}

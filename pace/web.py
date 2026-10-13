@@ -11,6 +11,7 @@ import difflib
 import gzip
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ from pace.db import now
 from pace import roadmap
 from pace import windows
 from pace.roadmap import RoadmapError
-from pace.runs import activity_line, git_project, latest_impl_output, latest_plan
+from pace.runs import activity_line, git_project, latest_impl_output, latest_plan, usage_view
 from pace.scheduler import paused_all, set_paused_all
 
 router = APIRouter()
@@ -93,6 +94,10 @@ def until(ts: float) -> str:
 templates.env.filters.update(md=md, mdi=md_inline, diff=diff_html, age=age, fromjson=fromjson,
                              clock=clock, until=until)
 
+# cache-busts /static links, so a deploy's CSS and JS replace what browsers hold
+templates.env.globals["static_v"] = int(max(
+    f.stat().st_mtime for f in (Path(__file__).parent / "static").iterdir()))
+
 INBOX_GROUPS = [("needs_input", "Questions"), ("plan_ready", "Plans to approve"),
                 ("ready_to_test", "Ready to test"), ("failed", "Problems")]
 
@@ -103,13 +108,18 @@ def render(request: Request, name: str, status: int = 200, **ctx: Any) -> HTMLRe
     return templates.TemplateResponse(request, name, {
         "inbox_count": len(it.inbox(st.db)) + len(it.open_proposals(st.db)),
         "all_projects": it.projects(st.db),
-        "rate_limit": st.db.kv_get("rate_limit"),
+        "usage": usage_now(request),
         "running": st.runner.active(),
         "backoff": st.runner.backoff(),
         "window": windows.status(st.cfg.run_windows),
         "paused_all": paused_all(st.db),
         **ctx,
     }, status_code=status)
+
+
+def usage_now(request: Request):
+    st = request.app.state
+    return usage_view(st.db.kv_get("rate_limit"), st.cfg.rate_limit_threshold, time.time())
 
 
 def back(url: str) -> RedirectResponse:
@@ -534,7 +544,7 @@ def system_context(request: Request) -> dict[str, Any]:
                            status=None, message=(fromjson(e["data_json"]) or {}).get("message"),
                            href=f"/i/{e['item_id']}"))
     errors.sort(key=lambda x: x["when"] or "", reverse=True)
-    usage = [(r, tokens(r["usage_json"])) for r in
+    run_usage = [(r, tokens(r["usage_json"])) for r in
              db.all(run_cols + "ORDER BY runs.id DESC LIMIT ?", RECENT)]
     totals = []
     for label, since in (("24 h", timedelta(days=1)), ("7 days", timedelta(days=7)),
@@ -545,7 +555,7 @@ def system_context(request: Request) -> dict[str, Any]:
         totals.append((label, row["n"], row["cost"]))
     return dict(current=current, busy={r["item_id"] for r in current
                                        if r["item_id"] and st.runner.busy(r["item_id"])},
-                errors=errors[:RECENT], usage=usage, totals=totals,
+                errors=errors[:RECENT], run_usage=run_usage, totals=totals,
                 paused_projects=[p for p in it.projects(db) if p["paused"]])
 
 
@@ -560,6 +570,13 @@ async def system_pause(request: Request):
     set_paused_all(db_(request), form.get("on") == "1")
     request.app.state.runner.publish("-")  # e.g. resumed: wake the scheduler
     return back("/system")
+
+
+@router.get("/usage", response_class=HTMLResponse)
+def usage_fragment(request: Request):
+    """Just the header usage indicator, for pace.js to swap in when it changes (§13)."""
+    return templates.TemplateResponse(request, "_usage.html", {"usage": usage_now(request)},
+                                      headers={"Cache-Control": "no-store"})
 
 
 # --- SSE ----------------------------------------------------------------------------------

@@ -203,6 +203,24 @@ def test_backoff_banner(client, db):
     assert "Rate-limit backoff" in page and "rejected" in page and "(in 2h 5m)" in page
 
 
+def test_usage_indicator(client, db):
+    page = client.get("/").text
+    assert 'id="usage"' in page and "pie" not in page
+    assert client.get("/usage").text.strip() == ""
+    db.kv_set("rate_limit", {"status": "allowed", "unifiedWindows": {
+        "five_hour": {"utilization": 0.34, "resetsAt": time.time() + 7530},
+        "seven_day": {"utilization": 0.61, "resetsAt": time.time() - 10}},
+        "seen_at": now()})
+    for html in (client.get("/").text, client.get("/usage").text):
+        assert "--p: 34" in html and "5h 34%" in html and "(in 2h 5m)" in html
+        assert "7d 0%" in html and "reset since this was seen" in html  # its reset has passed
+        assert "As of" in html and "error-text" not in html
+    assert client.get("/system").text.count('class="pie') == 2
+    db.kv_set("rate_limit", {"status": "rejected", "resetsAt": time.time() + 600})
+    html = client.get("/usage").text
+    assert 'class="usage bad"' in html and "rejected" in html
+
+
 def test_pause_all_switch(client, db):
     page = client.get("/").text
     assert 'href="/system"' in page and "all paused" not in page
